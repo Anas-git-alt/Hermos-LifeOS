@@ -1,0 +1,8 @@
+.env
+*.secret
+*.key
+*.pem
+__pycache__/
+.venv/
+logs/*.log
+backups/*.tar.gz
