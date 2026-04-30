@@ -1,15 +1,28 @@
-# Work
+# Work Domain
 
-status: draft
-last_updated: unset
+---
+status: active
+last_updated: 2026-04-30
+confidence: high
+primary_sources:
+  - state/tasks.md
+  - memory/ledger/2026-04-30.md
+  - inbox/needs-answer/2026-04-30.md
+---
 
 ## Current Understanding
+User has an invoice to send due 2026-05-01, but feels stuck on the first step. Task logged as high priority.
 
-## Stable Facts
+## Active Work Items
+1. **Invoice Due 2026-05-01**
+   - Status: Pending, stuck
+   - Blocker: Unclear first step (question logged in open-questions.md)
+   - Source: raw/captures/2026-04-30.md, state/tasks.md
 
-## Active Items
+## Open Questions
+- What are the steps to send the invoice?
 
-## Patterns
-
-## Sources
-
+## Links
+- [[commitments]]
+- [[open-questions]]
+- [[current-state]]
