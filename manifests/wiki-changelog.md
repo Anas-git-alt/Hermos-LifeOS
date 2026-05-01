@@ -18,3 +18,10 @@
 ## 2026-04-30T19:52:00Z
 - Updated wiki/patterns/sleep-patterns.md: added recurring late sleep pattern
 - Updated wiki/domains/work.md: added invoice next-day deadline commitment
+
+## 2026-05-01T01:02:27Z
+- Updated wiki/current-state.md: added TODAY note for invoice deadline, updated last_updated to 2026-05-01
+- Updated wiki/domains/work.md: added DUE TODAY note for invoice, updated last_updated to 2026-05-01
+- Updated wiki/commitments.md: added DUE TODAY note for invoice, updated last_updated to 2026-05-01
+- No new sources (no 2026-05-01 captures, empty memory/review)
+- No new contradictions or open questions added

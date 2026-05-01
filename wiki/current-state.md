@@ -2,16 +2,17 @@
 
 ---
 status: active
-last_updated: 2026-04-30
+last_updated: 2026-05-01
 confidence: high
 primary_sources:
   - raw/captures/2026-04-30.md
   - memory/ledger/2026-04-30.md
   - reports/nightly/2026-04-30-triage.md
+  - state/tasks.md
 ---
 
 ## Summary
-User is processing end-of-month invoice task (due 2026-05-01) but feels stuck on first steps. Reports recurring late sleep pattern. Energy tracking research queued.
+User has an invoice due TODAY (2026-05-01) and remains stuck on first steps. Recurring late sleep pattern confirmed. Energy tracking research queued.
 
 ## Current Priorities
 1. Send invoice (due 2026-05-01) - stuck, needs step clarification
@@ -19,7 +20,7 @@ User is processing end-of-month invoice task (due 2026-05-01) but feels stuck on
 3. Research energy tracking system
 
 ## Current Risks
-- Invoice deadline risk: due tomorrow, user unclear on first step
+- Invoice deadline risk: DUE TODAY, user unclear on first step
 - Sleep pattern risk: recurring late nights may impact focus/energy
 
 ## Current Supportive Context
@@ -28,4 +29,4 @@ User is processing end-of-month invoice task (due 2026-05-01) but feels stuck on
 - Sleep pattern logged as habit log in ledger
 
 ## Source Notes
-Compiled from 2026-04-30 triage outputs. Memory candidates for sleep pattern and invoice awareness pending review in memory/review/2026-04-30.md.
+Compiled from 2026-04-30 triage outputs. Memory candidates for sleep pattern and invoice awareness pending review in memory/review/2026-04-30.md. Updated 2026-05-01 to reflect invoice due date.

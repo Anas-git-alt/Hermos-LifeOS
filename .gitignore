@@ -4,5 +4,14 @@
 *.pem
 __pycache__/
 .venv/
+.venv-discord-tracker/
 logs/*.log
 backups/*.tar.gz
+.env.discord-tracker
+data/lifeos_tracker.db
+data/prayer/*.jsonl
+data/prayer/*.md
+data/hydration/*.jsonl
+data/hydration/*.md
+raw/captures/*tax*
+.codex
