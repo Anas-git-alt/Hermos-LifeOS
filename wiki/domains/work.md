@@ -2,7 +2,7 @@
 
 ---
 status: active
-last_updated: 2026-05-01
+last_updated: 2026-05-02
 confidence: high
 primary_sources:
   - state/tasks.md
@@ -11,11 +11,11 @@ primary_sources:
 ---
 
 ## Current Understanding
-User has an invoice to send due TODAY (2026-05-01), but feels stuck on the first step. Task logged as high priority.
+User has an invoice to send due 2026-05-01, now OVERDUE (1 day late). User remains stuck on the first step. Task logged as high priority.
 
 ## Active Work Items
-1. **Invoice Due 2026-05-01**
-   - Status: Pending, stuck (DUE TODAY)
+1. **Invoice Due 2026-05-01 (OVERDUE)**
+   - Status: Pending, stuck (OVERDUE as of 2026-05-02)
    - Blocker: Unclear first step (question logged in open-questions.md)
    - Source: raw/captures/2026-04-30.md, state/tasks.md
 

@@ -1,10 +1,9 @@
-# Commitments
+# Life OS Commitments
+*Append-only list of active commitments with source references*
 
-## 2026-04-30: Invoice Deadline
-
-- **Commitment**: Send invoice
-- **Deadline**: Next day (2026-05-01)
-- **Source**: capture-20260430T192127+0100
-- **Status**: Pending
-- **Added**: 2026-04-30
-
+## 9or3a Financing
+- **Type**: Monthly installment payment
+- **Terms**: Lump sum already received; remaining monthly payments through October 2026
+- **Source**: raw/captures/2026-05-02_finance-intake.md
+- **Added**: 2026-05-02
+- **Status**: active
