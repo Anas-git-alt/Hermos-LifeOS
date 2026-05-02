@@ -1,27 +1,68 @@
-     1|# Wiki Changelog
-     2|
-     3|All meaningful updates to the Life OS Wiki.
-     4|
-     5|---
-     6|last_updated: 2026-04-30
-     7|---
-     8|
-     9|## 2026-04-30
-    10|- Updated current-state.md: added priorities, risks, supportive context from triage
-    11|- Updated open-questions.md: added invoice steps question
-    12|- Updated commitments.md: added invoice due 2026-05-01
-    13|- Created domains/health.md: added sleep pattern context
-    14|- Created domains/work.md: added invoice task context
-    15|- Created patterns/sleep-patterns.md: added recurring late sleep pattern
-    16|- Sources: 2026-04-30 triage, ledger, state files, memory review
-    17|
-## 2026-04-30T19:52:00Z
-- Updated wiki/patterns/sleep-patterns.md: added recurring late sleep pattern
-- Updated wiki/domains/work.md: added invoice next-day deadline commitment
+# Wiki Changelog
 
-## 2026-05-01T01:02:27Z
-- Updated wiki/current-state.md: added TODAY note for invoice deadline, updated last_updated to 2026-05-01
-- Updated wiki/domains/work.md: added DUE TODAY note for invoice, updated last_updated to 2026-05-01
-- Updated wiki/commitments.md: added DUE TODAY note for invoice, updated last_updated to 2026-05-01
-- No new sources (no 2026-05-01 captures, empty memory/review)
-- No new contradictions or open questions added
+All meaningful wiki updates are logged here with sources and affected pages.
+
+---
+
+## 2026-05-02
+
+### Money Wiki Populated
+- **Pages updated**: `wiki/domains/money.md`
+- **Sources**: 
+  - `raw/captures/2026-05-02_finance-intake.md`
+  - `data/finance/2026-04-28.md` through `2026-05-01.md`
+  - `state/commitments.md`
+- **Changes**:
+  - Added stable facts: salary (12,949 DH), rent (3,000 DH), 9or3a payments through Oct 2026
+  - Added spending patterns (~130 DH/day food for family of 2)
+  - Added recent activity summary (28 Apr – 1 May)
+  - Added open questions for future clarification
+  - Set status to active, confidence to high
+- **Confidence**: high
+- **User action**: None required
+
+### Finance Data Processing
+- **Files created**:
+  - `data/finance/2026-04-28.md`
+  - `data/finance/2026-04-29.md`
+  - `data/finance/2026-04-30.md`
+  - `data/finance/2026-05-01.md`
+- **Structured logs**: Categorized all transactions from raw capture into income/expenses with categories (salary, housing, debt, food, family, tech, shopping, home, subscription, transfers)
+- **Automation update**: Added finance review processor so Discord finance notes are agent-processed automatically; manual money commands are fallback only
+- **Reporting update**: Added weekly finance report and removed normal finance rollups from daily summaries unless money is tied to a commitment, promise to pay, or deadline
+- **Sources**:
+  - `scripts/process_finance_reviews.py`
+  - `scripts/summarize_finance_week.py`
+  - `reports/weekly/2026-05-02-finance.md`
+
+### Task Management
+- **Task cancelled**: task-20260430-invoice (due 2026-05-01) - status changed to cancelled
+- **Commitment recorded**: 9or3a monthly payments through October 2026 added to `state/commitments.md`
+
+---
+
+## Format
+Each entry should include:
+- Date
+- Pages updated
+- Sources used
+- Changes made
+- Confidence level
+- Any user action needed
+
+### Manual Wiki Update (2026-05-02 - Session)
+- **Pages updated**: `wiki/domains/money.md`
+- **Sources**: 
+  - `raw/captures/2026-05-02.md` (new bills: wifi 300 DH, wife phone 100 DH, phone 65 DH)
+  - `data/finance/2026-05-02.md` (processed daily log)
+  - User correction via Discord (9or3a duplicate removal)
+- **Changes**:
+  - Corrected 9or3a duplicate: Removed erroneous second 2,500 DH entry from 28 Apr
+  - Added 2 May transactions: Wifi (-300), Wife phone (-100), Phone (-65)
+  - Updated total expenses: -8,162 DH (was -7,697 DH)
+  - Updated net position: +4,787 DH (was +5,252 DH)
+  - Added monthly bills to Stable Facts (Wifi, Wife phone, My phone)
+  - Extended date range to "28 Apr – 2 May 2026"
+  - Updated food spending pattern sample period to include 2 May
+- **Confidence**: high
+- **User action**: None required - manually triggered wiki update completed

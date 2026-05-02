@@ -8,6 +8,7 @@ This sidecar is a standalone Discord bot for Hermis Life OS. It does not depend 
 - Runtime database: `data/lifeos_tracker.db`
 - Prayer logs: `data/prayer/YYYY-MM-DD.jsonl` and `data/prayer/YYYY-MM-DD.md`
 - Hydration logs: `data/hydration/YYYY-MM-DD.jsonl` and `data/hydration/YYYY-MM-DD.md`
+- Finance logs: `data/finance/YYYY-MM-DD.jsonl` and `data/finance/YYYY-MM-DD.md`
 
 ## Setup
 
@@ -19,6 +20,7 @@ DISCORD_GUILD_ID=
 DISCORD_OWNER_IDS=
 PRAYER_CHANNEL_NAME=prayer-tracker
 HYDRATION_CHANNEL_NAME=habits
+FINANCE_CHANNEL_NAME=finance-tracker
 LIFEOS_ROOT=/home/ubuntu/hermis-life-os
 TRACKER_DB=/home/ubuntu/hermis-life-os/data/lifeos_tracker.db
 TIMEZONE=Africa/Casablanca
@@ -33,6 +35,7 @@ HYDRATION_TARGET_COUNT=8
 ```
 
 `DISCORD_OWNER_IDS` accepts comma-separated or space-separated numeric Discord user IDs. Only those users can log prayer and hydration reactions.
+Only those users can use hydration and finance logging/summary commands.
 
 ## Discord Permissions
 
@@ -44,11 +47,13 @@ The bot needs:
 - Add Reactions
 - Read Message History
 - Use Message Content Intent for `!prayertoday`, `!water`, and `!hydration`
+- Use Message Content Intent for finance channel capture and `!money` commands
 
 Create these channels, or override the names in env:
 
 - `#prayer-tracker`
 - `#habits`
+- `#finance-tracker`
 
 ## Run Locally
 
@@ -98,6 +103,9 @@ Prayer reactions:
 - `🕒` logs `late`
 - `❌` logs `missed`
 
+Repeating the same owner status on the same prayer reminder is ignored. Changing
+to a different status updates the stored prayer status.
+
 Hydration reminders run between `HYDRATION_START_HOUR` and `HYDRATION_END_HOUR` every `HYDRATION_INTERVAL_MINUTES`.
 
 Hydration reactions:
@@ -107,11 +115,71 @@ Hydration reactions:
 - `💤` snoozes reminders for 30 minutes
 - `❌` skips the reminder
 
+The first owner reaction on a hydration reminder is logged. Repeated owner reactions
+on the same reminder are ignored so hydration cannot double-count after remove/readd
+or emoji changes.
+
+Finance capture watches owner messages in `#finance-tracker` (or `FINANCE_CHANNEL_NAME`).
+Normal text is captured as a raw source and placed in the finance review queue for
+Hermis/nightly processing. The bot does not auto-parse Discord finance messages
+into ledger transactions.
+
+Nightly automation should run:
+
+```bash
+scripts/process_finance_reviews.py <YYYY-MM-DD> --all-open
+```
+
+Weekly finance rollup should run:
+
+```bash
+scripts/summarize_finance_week.py <week-ending-YYYY-MM-DD>
+```
+
+`process_finance_reviews.py` resolves clear review items automatically and writes
+clarification questions only for unclear notes. Manual `!money edit` is fallback,
+not normal workflow.
+
+Finance examples:
+
+```text
+spent 45 lunch
+paid Netflix 12 USD
+saved 300 emergency fund
+salary 15000 MAD
+```
+
+Multiple entries in one Discord message are allowed. They stay together as one
+review item until Hermis or `!money edit review:<id> ...` resolves them into
+one or more ledger transactions.
+
+Default currency is `MAD`. Non-MAD entries keep original currency and are not
+normalized to MAD unless a later correction provides the MAD amount.
+
+Finance categories:
+
+`groceries`, `eating_out`, `transport`, `rent`, `utilities`, `subscriptions`,
+`shopping`, `health`, `family`, `deen_charity`, `work_tools`, `education`,
+`travel`, `fees_taxes`, `entertainment`, `savings`, `income`, `transfer`,
+`unknown`.
+
+Finance memory policy:
+
+- Raw finance messages, tracker DB rows, and detailed daily logs stay local.
+- Hermes/OpenViking should use `wiki/domains/money.md`, nightly/weekly finance summaries, and approved curated money memories.
+- Durable money patterns go through `memory/review` before `memory/curated`.
+- Weekly finance reports carry normal spend rollups. Daily reports mention finance only for commitments, promises to pay, or deadlines.
+
 ## Commands
 
 - `!prayertoday` shows today's prayer windows.
 - `!water [count] [note]` manually logs hydration. Example: `!water 2 after walk`.
-- `!hydration` shows today's hydration count.
+- `!hydration` shows today's hydration count for owners.
+- `!money today` shows today's finance totals.
+- `!money month [YYYY-MM]` shows month finance totals.
+- `!money review` lists finance captures waiting for Hermis/user review.
+- `!money edit <id|tx:id|review:id> <corrected text>` updates a transaction or resolves a review. For reviews, corrected text can contain multiple lines.
+- `!money void <id|tx:id|review:id>` voids a transaction or review item.
 - `!testprayer [PrayerName]` posts a short test prayer embed for smoke testing reactions.
 
 ## Smoke Tests
@@ -123,8 +191,10 @@ Hydration reactions:
 5. React from a non-owner account and confirm no log or confirmation is created.
 6. Run `!water 2 after walk` and confirm hydration increments by 2.
 7. React to a hydration reminder with `💧` or `🥤` and confirm the count updates.
-8. Check `data/prayer/` and `data/hydration/` for daily `.jsonl` and `.md` files.
-9. Restart the systemd service and confirm it returns to `active (running)`.
+8. Post `spent 45 lunch` in `#finance-tracker` and confirm a Hermis review item is created.
+9. Post two lines of expenses in one message and confirm they stay as one review item.
+10. Check `data/prayer/`, `data/hydration/`, and `data/finance/` for daily `.jsonl` and `.md` files.
+11. Restart the systemd service and confirm it returns to `active (running)`.
 
 ## Tests
 
@@ -138,6 +208,7 @@ Covered areas:
 - Owner validation
 - Reaction mapping
 - Hydration count updates and log file creation
+- Finance review-first capture, multi-entry resolution, storage, idempotency, edit, void, and summaries
 - AlAdhan response parsing using a fixture
 
 ## Troubleshooting

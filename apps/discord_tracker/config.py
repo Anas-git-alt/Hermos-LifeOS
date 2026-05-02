@@ -18,6 +18,7 @@ class TrackerConfig:
     discord_owner_ids: frozenset[int]
     prayer_channel_name: str
     hydration_channel_name: str
+    finance_channel_name: str
     lifeos_root: Path
     tracker_db: Path
     timezone: str
@@ -90,6 +91,7 @@ def load_config() -> TrackerConfig:
         discord_owner_ids=parse_owner_ids(os.getenv("DISCORD_OWNER_IDS")),
         prayer_channel_name=os.getenv("PRAYER_CHANNEL_NAME", "prayer-tracker"),
         hydration_channel_name=os.getenv("HYDRATION_CHANNEL_NAME", "habits"),
+        finance_channel_name=os.getenv("FINANCE_CHANNEL_NAME", "finance-tracker"),
         lifeos_root=lifeos_root,
         tracker_db=tracker_db,
         timezone=os.getenv("TIMEZONE", "Africa/Casablanca"),

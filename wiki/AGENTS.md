@@ -45,6 +45,10 @@ primary_sources:
 - If a new source contradicts an old page, update wiki/contradictions.md.
 - If a claim is stale, mark it as stale or superseded.
 - If a fact is sensitive, summarize minimally and link to the local source path.
+- Index wiki pages and user-approved memory/curated entries into OpenViking by default.
+- Do not index raw captures, raw documents, tracker logs, databases, env files, or backups without explicit user approval for that exact action.
+- Finance is sensitive: use wiki/domains/money.md and compact daily/nightly summaries first. Do not index raw finance messages, tracker DB rows, or detailed finance logs by default.
+- Normal finance rollups belong in weekly reports. Daily reports mention money only for commitments, promises to pay, or deadlines.
 
 ## File Naming
 
@@ -74,6 +78,8 @@ When answering a Life OS question:
 3. Search OpenViking for supporting context.
 4. Answer from compiled wiki first, then supporting sources.
 5. If useful, file new synthesis back into the wiki.
+6. For money questions, prefer summarized finance sources before any raw finance log inspection.
+7. Treat finance review queue as an agent inbox, not user homework; process automatically and ask only when unclear.
 
 ### Lint
 

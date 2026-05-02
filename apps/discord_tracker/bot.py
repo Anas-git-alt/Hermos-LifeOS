@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands, tasks
 
 from config import TrackerConfig, is_owner_id, load_config
+from finance import finance_review_request, parse_finance_message
 from hydration import (
     HYDRATION_REACTIONS,
     hydration_embed_text,
@@ -65,6 +66,16 @@ class DiscordTracker(commands.Bot):
     async def on_ready(self) -> None:
         LOGGER.info("Discord tracker logged in as %s", self.user)
 
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot:
+            return
+        content = (message.content or "").strip()
+        if content.startswith(str(self.command_prefix)):
+            await self.process_commands(message)
+            return
+        await self._maybe_capture_finance_message(message, content)
+        await self.process_commands(message)
+
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == (self.user.id if self.user else None):
             return
@@ -98,7 +109,7 @@ class DiscordTracker(commands.Bot):
     async def _handle_prayer_reaction(self, payload, channel, footer, emoji: str) -> None:
         status = PRAYER_REACTIONS[emoji]
         window_end_utc = await self._window_end_utc(footer.local_date, footer.prayer_name)
-        await self.store.log_prayer(
+        created = await self.store.log_prayer(
             local_date=footer.local_date,
             prayer_name=footer.prayer_name,
             window_id=footer.window_id,
@@ -108,13 +119,21 @@ class DiscordTracker(commands.Bot):
             logged_by=payload.user_id,
             window_end_utc=window_end_utc,
         )
+        if not created:
+            LOGGER.info(
+                "Ignored duplicate prayer reaction for %s %s by %s",
+                footer.local_date,
+                footer.prayer_name,
+                payload.user_id,
+            )
+            return
         await channel.send(
             f"Logged `{footer.prayer_name}` for {footer.local_date}: {status}."
         )
 
     async def _handle_hydration_reaction(self, payload, channel, footer, emoji: str) -> None:
         action, delta = HYDRATION_REACTIONS[emoji]
-        new_count = await self.store.log_hydration(
+        new_count, created = await self.store.log_hydration_reaction(
             local_date=footer.local_date,
             reminder_id=footer.reminder_id,
             action=action,
@@ -124,6 +143,14 @@ class DiscordTracker(commands.Bot):
             channel_id=payload.channel_id,
             logged_by=payload.user_id,
         )
+        if not created:
+            LOGGER.info(
+                "Ignored duplicate hydration reaction for %s %s by %s",
+                footer.local_date,
+                footer.reminder_id,
+                payload.user_id,
+            )
+            return
         if action == "snooze":
             await self.store.set_hydration_snooze(
                 footer.local_date,
@@ -136,6 +163,43 @@ class DiscordTracker(commands.Bot):
             await channel.send(
                 f"Hydration logged: +{delta}. Today: {new_count}/{self.config.hydration_target_count}."
             )
+
+    async def _maybe_capture_finance_message(self, message: discord.Message, content: str) -> None:
+        if not content:
+            return
+        if not is_owner_id(message.author.id, self.config.discord_owner_ids):
+            return
+        channel_name = getattr(message.channel, "name", "")
+        if channel_name != self.config.finance_channel_name:
+            return
+
+        local_date = datetime.now(self.tz).date().isoformat()
+        parsed = finance_review_request()
+        result = await self.store.log_finance_message(
+            local_date=local_date,
+            raw_text=content,
+            parsed=parsed,
+            message_id=message.id,
+            channel_id=message.channel.id,
+            channel_name=channel_name,
+            logged_by=message.author.id,
+        )
+        if not result.get("created"):
+            return
+        if result["status"] == "parsed":
+            await message.channel.send(_finance_logged_text(result["transaction_ids"], parsed.entries))
+            return
+        reason = result.get("review_reason") or parsed.review_reason
+        if reason == "hermis_review_required":
+            await message.channel.send(
+                f"Captured money note `{result['review_id']}` for Hermis review. "
+                f"Use `!money edit review:{result['review_id']} <corrected text>` only for immediate ledger entry."
+            )
+            return
+        await message.channel.send(
+            f"Money needs review `{result['review_id']}`: {reason}. "
+            f"Use `!money edit review:{result['review_id']} <corrected text>`."
+        )
 
     async def _window_end_utc(self, local_date: str, prayer_name: str) -> datetime | None:
         try:
@@ -307,9 +371,105 @@ class DiscordTracker(commands.Bot):
 
         @self.command(name="hydration")
         async def hydration(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
             local_date = datetime.now(self.tz).date().isoformat()
             total = await self.store.get_hydration_count(local_date)
             await ctx.send(f"Hydration today: {total}/{self.config.hydration_target_count}.")
+
+        @self.group(name="money", invoke_without_command=True)
+        async def money(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            summary = await self.store.get_finance_day_summary(local_date)
+            await ctx.send(_finance_summary_text(f"Money today ({local_date})", summary))
+
+        @money.command(name="today")
+        async def money_today(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            summary = await self.store.get_finance_day_summary(local_date)
+            await ctx.send(_finance_summary_text(f"Money today ({local_date})", summary))
+
+        @money.command(name="month")
+        async def money_month(ctx: commands.Context, month: str | None = None) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            month = month or datetime.now(self.tz).strftime("%Y-%m")
+            try:
+                datetime.strptime(month, "%Y-%m")
+            except ValueError:
+                await ctx.send("Use month as `YYYY-MM`.")
+                return
+            summary = await self.store.get_finance_month_summary(month)
+            await ctx.send(_finance_summary_text(f"Money month ({month})", summary))
+
+        @money.command(name="review")
+        async def money_review(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            reviews = await self.store.list_finance_reviews()
+            if not reviews:
+                await ctx.send("No money reviews open.")
+                return
+            lines = ["Open money reviews:"]
+            for item in reviews:
+                raw_text = item["raw_text"]
+                if len(raw_text) > 80:
+                    raw_text = raw_text[:77] + "..."
+                lines.append(f"- review:{item['id']} {item['local_date']} {item['reason']}: {raw_text}")
+            await ctx.send("\n".join(lines))
+
+        @money.command(name="edit")
+        async def money_edit(ctx: commands.Context, item_id: str, *, replacement: str) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            parsed = parse_finance_message(replacement)
+            if parsed.status != "parsed" or not parsed.entries:
+                await ctx.send(f"Could not parse correction: {parsed.review_reason or 'needs_review'}.")
+                return
+
+            ref_kind, numeric_id = _parse_money_ref(item_id)
+            if ref_kind == "review":
+                records = await self.store.resolve_finance_review(numeric_id, parsed.entries)
+                if records is None:
+                    await ctx.send(f"No open money item `{item_id}` found.")
+                    return
+                await ctx.send(_finance_logged_text([record["id"] for record in records], parsed.entries))
+                return
+            elif ref_kind == "tx":
+                if len(parsed.entries) != 1:
+                    await ctx.send("Edit one transaction at a time, or resolve a `review:id` with multiple lines.")
+                    return
+                record = await self.store.edit_finance_transaction(numeric_id, parsed.entries[0])
+            else:
+                if len(parsed.entries) != 1:
+                    await ctx.send("Use `review:id` when corrected text has multiple entries.")
+                    return
+                record = await self.store.edit_finance_transaction(numeric_id, parsed.entries[0])
+                if record is None:
+                    records = await self.store.resolve_finance_review(numeric_id, parsed.entries)
+                    if records is not None:
+                        await ctx.send(_finance_logged_text([item["id"] for item in records], parsed.entries))
+                        return
+
+            if record is None:
+                await ctx.send(f"No open money item `{item_id}` found.")
+                return
+            await ctx.send(f"Money `{record['id']}` updated: {_finance_entry_text(parsed.entries[0])}.")
+
+        @money.command(name="void")
+        async def money_void(ctx: commands.Context, item_id: str) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            _ref_kind, numeric_id = _parse_money_ref(item_id)
+            result = await self.store.void_finance_item(numeric_id)
+            if result is None:
+                await ctx.send(f"No open money item `{item_id}` found.")
+                return
+            await ctx.send(f"Voided money {result['kind']} `{result['id']}`.")
 
         @self.command(name="testprayer")
         async def testprayer(ctx: commands.Context, prayer_name: str = "Dhuhr") -> None:
@@ -351,6 +511,52 @@ def _parse_water_args(first: str, note: str) -> tuple[int, str]:
 def _normalize_prayer_name(value: str) -> str:
     lookup = {name.lower(): name for name in PRAYER_NAMES}
     return lookup.get(value.lower(), value.title())
+
+
+def _finance_entry_text(entry) -> str:
+    amount = f"{entry.amount} {entry.currency}"
+    if entry.amount_mad is None and entry.currency != "MAD":
+        amount += " (not normalized to MAD)"
+    return f"{entry.kind} {amount} / {entry.category} / {entry.description}"
+
+
+def _finance_logged_text(transaction_ids, entries) -> str:
+    if len(transaction_ids) == 1:
+        return f"Logged money tx `{transaction_ids[0]}`: {_finance_entry_text(entries[0])}."
+    ids = ", ".join(f"`{item}`" for item in transaction_ids)
+    total_mad = sum(entry.amount_mad for entry in entries if entry.amount_mad is not None)
+    return f"Logged money txs {ids}: {len(entries)} entries, {total_mad} MAD tracked."
+
+
+def _finance_summary_text(title: str, summary: dict) -> str:
+    lines = [
+        f"**{title}**",
+        f"- Transactions: {summary['transaction_count']}",
+        f"- Expenses: {summary['expense_mad']} MAD",
+        f"- Income: {summary['income_mad']} MAD",
+        f"- Savings: {summary['savings_mad']} MAD",
+        f"- Transfers: {summary['transfer_mad']} MAD",
+    ]
+    if summary["by_category"]:
+        categories = ", ".join(
+            f"{category} {amount} MAD"
+            for category, amount in summary["by_category"].items()
+        )
+        lines.append(f"- Categories: {categories}")
+    if summary["non_mad"]:
+        lines.append(f"- Non-MAD entries: {len(summary['non_mad'])} not normalized")
+    if summary["needs_review_count"]:
+        lines.append(f"- Needs review: {summary['needs_review_count']}")
+    return "\n".join(lines)
+
+
+def _parse_money_ref(value: str) -> tuple[str | None, int]:
+    token = value.strip().lower()
+    if ":" in token:
+        prefix, raw_id = token.split(":", 1)
+        if prefix in {"review", "tx"}:
+            return prefix, int(raw_id)
+    return None, int(token)
 
 
 async def main() -> None:

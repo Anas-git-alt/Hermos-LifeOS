@@ -13,5 +13,8 @@ data/prayer/*.jsonl
 data/prayer/*.md
 data/hydration/*.jsonl
 data/hydration/*.md
+data/finance/*.jsonl
+data/finance/*.md
+data/daily-summary/*.md
 raw/captures/*tax*
 .codex
