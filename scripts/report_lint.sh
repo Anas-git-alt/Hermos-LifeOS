@@ -72,6 +72,17 @@ if "using send_message" in prompt or "Then send this summary" in prompt:
 if "Do not call send_message" not in prompt:
     print("FAIL: Discord morning summary prompt lacks send_message guard")
     raise SystemExit(1)
+discord_required = [
+    "Overnight system status",
+    "finance review result",
+    "memory review result",
+    "needs-answer",
+    "Do not mention resolved finance reviews as blockers",
+]
+missing_discord = [item for item in discord_required if item not in prompt]
+if missing_discord:
+    print("FAIL: Discord morning summary prompt lacks overnight visibility requirements: " + ", ".join(missing_discord))
+    raise SystemExit(1)
 if job.get("deliver") != "discord:#daily-plan":
     print(f"FAIL: Discord morning summary deliver target is {job.get('deliver')!r}")
     raise SystemExit(1)
