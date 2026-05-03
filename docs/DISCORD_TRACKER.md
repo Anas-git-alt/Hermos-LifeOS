@@ -9,6 +9,7 @@ This sidecar is a standalone Discord bot for Hermis Life OS. It does not depend 
 - Prayer logs: `data/prayer/YYYY-MM-DD.jsonl` and `data/prayer/YYYY-MM-DD.md`
 - Hydration logs: `data/hydration/YYYY-MM-DD.jsonl` and `data/hydration/YYYY-MM-DD.md`
 - Finance logs: `data/finance/YYYY-MM-DD.jsonl` and `data/finance/YYYY-MM-DD.md`
+- Work logs: `data/work/YYYY-MM-DD.jsonl` and `data/work/YYYY-MM-DD.md`
 
 ## Setup
 
@@ -21,6 +22,7 @@ DISCORD_OWNER_IDS=
 PRAYER_CHANNEL_NAME=prayer-tracker
 HYDRATION_CHANNEL_NAME=habits
 FINANCE_CHANNEL_NAME=finance-tracker
+WORK_CHANNEL_NAME=work-tracker
 LIFEOS_ROOT=/home/ubuntu/hermis-life-os
 TRACKER_DB=/home/ubuntu/hermis-life-os/data/lifeos_tracker.db
 TIMEZONE=Africa/Casablanca
@@ -32,10 +34,12 @@ HYDRATION_START_HOUR=9
 HYDRATION_END_HOUR=22
 HYDRATION_INTERVAL_MINUTES=90
 HYDRATION_TARGET_COUNT=8
+WORK_START_HOUR=14
+WORK_END_HOUR=23
 ```
 
 `DISCORD_OWNER_IDS` accepts comma-separated or space-separated numeric Discord user IDs. Only those users can log prayer and hydration reactions.
-Only those users can use hydration and finance logging/summary commands.
+Only those users can use hydration, finance, and work logging/summary commands.
 
 ## Discord Permissions
 
@@ -48,12 +52,14 @@ The bot needs:
 - Read Message History
 - Use Message Content Intent for `!prayertoday`, `!water`, and `!hydration`
 - Use Message Content Intent for finance channel capture and `!money` commands
+- Use Message Content Intent for work channel capture and `!work` commands
 
 Create these channels, or override the names in env:
 
 - `#prayer-tracker`
 - `#habits`
 - `#finance-tracker`
+- `#work-tracker`
 
 ## Run Locally
 
@@ -172,6 +178,29 @@ Finance memory policy:
 - Durable money patterns go through `memory/review` before `memory/curated`; safe high-confidence facts may be auto-promoted by the nightly memory review.
 - Weekly finance reports carry normal spend rollups. Daily reports mention finance only for commitments, promises to pay, or deadlines.
 
+Work capture watches owner messages in `#work-tracker` (or `WORK_CHANNEL_NAME`).
+Normal text is saved as a raw `work_captures` row with source metadata and
+`draft_parse_json`, then marked unreviewed. The bot does not turn normal work
+tracker messages into final tasks.
+
+Nightly work automation should run:
+
+```bash
+scripts/process_work_reviews.py <YYYY-MM-DD> --all-open
+```
+
+`process_work_reviews.py` mirrors the finance review safety model: it fetches
+unreviewed/unclear captures, calls the Hermis work reviewer, validates JSON,
+then confirms, corrects/splits, ignores with an explicit reason, or writes
+clarification questions. Only confirmed review output creates `work_items`.
+
+Work window:
+
+- Timezone: `Africa/Casablanca`
+- Window: `14:00-23:00`
+
+See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
+
 ## Commands
 
 - `!prayertoday` shows today's prayer windows.
@@ -182,6 +211,15 @@ Finance memory policy:
 - `!money review` lists finance captures waiting for Hermis/user review.
 - `!money edit <id|tx:id|review:id> <corrected text>` updates a transaction or resolves a review. For reviews, corrected text can contain multiple lines.
 - `!money void <id|tx:id|review:id>` voids a transaction or review item.
+- `!work` shows today's confirmed work and open capture review count.
+- `!work add <text>` explicitly creates confirmed work from command text.
+- `!work list` shows active confirmed work.
+- `!work today` shows confirmed work due or scheduled today.
+- `!work focus` shows a focus list for the 14:00-23:00 Casablanca work window.
+- `!work done <id>` marks a confirmed item done.
+- `!work block <id> <reason>` marks a confirmed item blocked.
+- `!work wait <id> <reason>` marks a confirmed item waiting.
+- `!work review` shows confirmed work plus unreviewed/unclear captures.
 - `!testprayer [PrayerName]` posts a short test prayer embed for smoke testing reactions.
 
 ## Smoke Tests
@@ -195,8 +233,10 @@ Finance memory policy:
 7. React to a hydration reminder with `💧` or `🥤` and confirm the count updates.
 8. Post `spent 45 lunch` in `#finance-tracker` and confirm a Hermis review item is created.
 9. Post two lines of expenses in one message and confirm they stay as one review item.
-10. Check `data/prayer/`, `data/hydration/`, and `data/finance/` for daily `.jsonl` and `.md` files.
-11. Restart the systemd service and confirm it returns to `active (running)`.
+10. Post `send client update tomorrow` in `#work-tracker` and confirm a work capture is created, not a confirmed work item.
+11. Run `!work review` and confirm it shows confirmed work plus the unreviewed capture.
+12. Check `data/prayer/`, `data/hydration/`, `data/finance/`, and `data/work/` for daily `.jsonl` and `.md` files.
+13. Restart the systemd service and confirm it returns to `active (running)`.
 
 ## Tests
 
@@ -211,6 +251,7 @@ Covered areas:
 - Reaction mapping
 - Hydration count updates and log file creation
 - Finance review-first capture, multi-entry resolution, storage, idempotency, edit, void, and summaries
+- Work review-first capture, draft parse isolation, multi-item confirmation, clarifications, ignored reasons, and commands storage
 - AlAdhan response parsing using a fixture
 
 ## Troubleshooting

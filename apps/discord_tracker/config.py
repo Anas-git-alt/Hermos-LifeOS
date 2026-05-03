@@ -19,6 +19,7 @@ class TrackerConfig:
     prayer_channel_name: str
     hydration_channel_name: str
     finance_channel_name: str
+    work_channel_name: str
     lifeos_root: Path
     tracker_db: Path
     timezone: str
@@ -30,6 +31,8 @@ class TrackerConfig:
     hydration_end_hour: int
     hydration_interval_minutes: int
     hydration_target_count: int
+    work_start_hour: int
+    work_end_hour: int
 
 
 def parse_owner_ids(raw: str | None) -> frozenset[int]:
@@ -92,6 +95,7 @@ def load_config() -> TrackerConfig:
         prayer_channel_name=os.getenv("PRAYER_CHANNEL_NAME", "prayer-tracker"),
         hydration_channel_name=os.getenv("HYDRATION_CHANNEL_NAME", "habits"),
         finance_channel_name=os.getenv("FINANCE_CHANNEL_NAME", "finance-tracker"),
+        work_channel_name=os.getenv("WORK_CHANNEL_NAME", "work-tracker"),
         lifeos_root=lifeos_root,
         tracker_db=tracker_db,
         timezone=os.getenv("TIMEZONE", "Africa/Casablanca"),
@@ -103,4 +107,6 @@ def load_config() -> TrackerConfig:
         hydration_end_hour=_int_env("HYDRATION_END_HOUR", 22),
         hydration_interval_minutes=_int_env("HYDRATION_INTERVAL_MINUTES", 90),
         hydration_target_count=_int_env("HYDRATION_TARGET_COUNT", 8),
+        work_start_hour=_int_env("WORK_START_HOUR", 14),
+        work_end_hour=_int_env("WORK_END_HOUR", 23),
     )

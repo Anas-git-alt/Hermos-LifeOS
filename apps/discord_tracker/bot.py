@@ -27,6 +27,13 @@ from prayer import (
     prayer_embed_text,
 )
 from store import TrackerStore
+from work import (
+    draft_parse_work_message,
+    item_from_manual_text,
+    render_work_focus,
+    render_work_items,
+    should_capture_work_message,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -74,6 +81,7 @@ class DiscordTracker(commands.Bot):
             await self.process_commands(message)
             return
         await self._maybe_capture_finance_message(message, content)
+        await self._maybe_capture_work_message(message, content)
         await self.process_commands(message)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
@@ -199,6 +207,33 @@ class DiscordTracker(commands.Bot):
         await message.channel.send(
             f"Money needs review `{result['review_id']}`: {reason}. "
             f"Use `!money edit review:{result['review_id']} <corrected text>`."
+        )
+
+    async def _maybe_capture_work_message(self, message: discord.Message, content: str) -> None:
+        if not should_capture_work_message(content):
+            return
+        if not is_owner_id(message.author.id, self.config.discord_owner_ids):
+            return
+        channel_name = getattr(message.channel, "name", "")
+        if channel_name != self.config.work_channel_name:
+            return
+
+        local_date = datetime.now(self.tz).date().isoformat()
+        draft_parse = draft_parse_work_message(content, datetime.now(self.tz).date())
+        result = await self.store.log_work_capture(
+            local_date=local_date,
+            raw_text=content,
+            draft_parse=draft_parse,
+            message_id=message.id,
+            channel_id=message.channel.id,
+            channel_name=channel_name,
+            logged_by=message.author.id,
+        )
+        if not result.get("created"):
+            return
+        await message.channel.send(
+            f"Captured work note `{result['capture_id']}` for Hermis review. "
+            "Draft parse is unconfirmed until nightly review."
         )
 
     async def _window_end_utc(self, local_date: str, prayer_name: str) -> datetime | None:
@@ -471,6 +506,149 @@ class DiscordTracker(commands.Bot):
                 return
             await ctx.send(f"Voided money {result['kind']} `{result['id']}`.")
 
+        @self.group(name="work", invoke_without_command=True)
+        async def work_group(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            today = await self.store.list_work_today(local_date, limit=8)
+            reviews = await self.store.list_work_reviews(limit=5)
+            lines = [render_work_items(f"Work today ({local_date})", today)]
+            if reviews:
+                lines.append("")
+                lines.append(f"Unreviewed / unclear captures: {len(reviews)}. Use `!work review`.")
+            await ctx.send(_discord_clip("\n".join(lines)))
+
+        @work_group.command(name="add")
+        async def work_add(ctx: commands.Context, *, text: str) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_day = datetime.now(self.tz).date()
+            local_date = local_day.isoformat()
+            draft_parse = draft_parse_work_message(text, local_day)
+            drafts = item_from_manual_text(text, local_day)
+            if not drafts:
+                result = await self.store.log_work_capture(
+                    local_date=local_date,
+                    raw_text=text,
+                    draft_parse=draft_parse,
+                    message_id=ctx.message.id,
+                    channel_id=ctx.channel.id,
+                    channel_name=getattr(ctx.channel, "name", "unknown"),
+                    logged_by=ctx.author.id,
+                    source="discord_command",
+                )
+                await ctx.send(
+                    f"Captured unclear work note `{result['capture_id']}` for review. "
+                    "No confirmed item was created."
+                )
+                return
+            result = await self.store.add_manual_work_items(
+                local_date=local_date,
+                raw_text=text,
+                drafts=drafts,
+                draft_parse=draft_parse,
+                message_id=ctx.message.id,
+                channel_id=ctx.channel.id,
+                channel_name=getattr(ctx.channel, "name", "unknown"),
+                logged_by=ctx.author.id,
+            )
+            if not result.get("created"):
+                await ctx.send(f"Work note `{result['capture_id']}` was already captured.")
+                return
+            ids = ", ".join(f"`{item_id}`" for item_id in result["item_ids"])
+            await ctx.send(f"Confirmed work item{'s' if len(result['item_ids']) != 1 else ''}: {ids}.")
+
+        @work_group.command(name="list")
+        async def work_list(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            items = await self.store.list_work_items("active", limit=15)
+            await ctx.send(_discord_clip(render_work_items("Active work", items)))
+
+        @work_group.command(name="today")
+        async def work_today(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            items = await self.store.list_work_today(local_date, limit=15)
+            await ctx.send(_discord_clip(render_work_items(f"Work today ({local_date})", items)))
+
+        @work_group.command(name="focus")
+        async def work_focus(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            focus, waiting = await self.store.work_focus_items(local_date, limit=5)
+            window = f"{self.config.work_start_hour:02d}:00-{self.config.work_end_hour:02d}:00 {self.config.timezone}"
+            await ctx.send(_discord_clip(render_work_focus(local_date, window, focus, waiting)))
+
+        @work_group.command(name="done")
+        async def work_done(ctx: commands.Context, item_id: int) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            item = await self.store.set_work_item_status(
+                item_id,
+                "done",
+                local_date=local_date,
+                logged_by=ctx.author.id,
+            )
+            if item is None:
+                await ctx.send(f"No work item `{item_id}` found.")
+                return
+            await ctx.send(f"Done: `{item_id}` {item['title']}.")
+
+        @work_group.command(name="block")
+        async def work_block(ctx: commands.Context, item_id: int, *, reason: str) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            item = await self.store.set_work_item_status(
+                item_id,
+                "blocked",
+                local_date=local_date,
+                reason=reason,
+                logged_by=ctx.author.id,
+            )
+            if item is None:
+                await ctx.send(f"No work item `{item_id}` found.")
+                return
+            await ctx.send(f"Blocked: `{item_id}` {item['title']} - {reason}.")
+
+        @work_group.command(name="wait")
+        async def work_wait(ctx: commands.Context, item_id: int, *, reason: str) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = datetime.now(self.tz).date().isoformat()
+            item = await self.store.set_work_item_status(
+                item_id,
+                "waiting",
+                local_date=local_date,
+                reason=reason,
+                logged_by=ctx.author.id,
+            )
+            if item is None:
+                await ctx.send(f"No work item `{item_id}` found.")
+                return
+            await ctx.send(f"Waiting: `{item_id}` {item['title']} - {reason}.")
+
+        @work_group.command(name="review")
+        async def work_review(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            confirmed = await self.store.list_work_items("active", limit=10)
+            reviews = await self.store.list_work_reviews(limit=10)
+            lines = [render_work_items("Confirmed work", confirmed), "", "**Unreviewed / unclear captures**"]
+            if reviews:
+                for item in reviews:
+                    snippet = _discord_clip(" ".join(item["raw_text"].split()), 140)
+                    detail = item["clarification_question"] or item["review_reason"]
+                    lines.append(f"- capture:`{item['id']}` {item['review_status']} ({detail}): {snippet}")
+            else:
+                lines.append("- none")
+            await ctx.send(_discord_clip("\n".join(lines)))
+
         @self.command(name="testprayer")
         async def testprayer(ctx: commands.Context, prayer_name: str = "Dhuhr") -> None:
             if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
@@ -557,6 +735,12 @@ def _parse_money_ref(value: str) -> tuple[str | None, int]:
         if prefix in {"review", "tx"}:
             return prefix, int(raw_id)
     return None, int(token)
+
+
+def _discord_clip(text: str, limit: int = 1900) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 async def main() -> None:

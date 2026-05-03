@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,9 @@ class TrackerStore:
         self.prayer_dir = self.lifeos_root / "data" / "prayer"
         self.hydration_dir = self.lifeos_root / "data" / "hydration"
         self.finance_dir = self.lifeos_root / "data" / "finance"
+        self.work_dir = self.lifeos_root / "data" / "work"
+        self.work_report_dir = self.lifeos_root / "reports" / "work"
+        self.state_dir = self.lifeos_root / "state"
         self.raw_capture_dir = self.lifeos_root / "raw" / "captures"
 
     async def init(self) -> None:
@@ -22,6 +25,9 @@ class TrackerStore:
         self.prayer_dir.mkdir(parents=True, exist_ok=True)
         self.hydration_dir.mkdir(parents=True, exist_ok=True)
         self.finance_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.work_report_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.raw_capture_dir.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(
@@ -158,6 +164,64 @@ class TrackerStore:
                     created_at_utc TEXT NOT NULL,
                     resolved_at_utc TEXT,
                     UNIQUE(source, source_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_date TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_message_id INTEGER,
+                    source_channel_id INTEGER,
+                    source_channel_name TEXT,
+                    logged_by INTEGER,
+                    raw_text TEXT NOT NULL,
+                    draft_parse_json TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    review_reason TEXT NOT NULL,
+                    review_status TEXT NOT NULL,
+                    clarification_question TEXT,
+                    ignore_reason TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    reviewed_at_utc TEXT,
+                    UNIQUE(source, source_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    capture_id INTEGER,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    project TEXT,
+                    area TEXT,
+                    due_date TEXT,
+                    scheduled_date TEXT,
+                    energy TEXT,
+                    effort_minutes INTEGER,
+                    context TEXT,
+                    tags_json TEXT NOT NULL,
+                    note TEXT,
+                    source TEXT NOT NULL,
+                    source_message_id INTEGER,
+                    source_channel_id INTEGER,
+                    logged_by INTEGER,
+                    raw_text TEXT NOT NULL,
+                    source_item_index INTEGER NOT NULL DEFAULT 0,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    completed_at_utc TEXT,
+                    cancelled_at_utc TEXT,
+                    UNIQUE(capture_id, source_item_index)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_item_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER,
+                    capture_id INTEGER,
+                    event TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL
                 );
                 """
             )
@@ -527,6 +591,472 @@ class TrackerStore:
             return None
         return datetime.fromisoformat(row[0])
 
+    async def log_work_capture(
+        self,
+        *,
+        local_date: str,
+        raw_text: str,
+        draft_parse: dict[str, Any] | str,
+        message_id: int | None,
+        channel_id: int | None,
+        channel_name: str,
+        logged_by: int | None,
+        source: str = "discord",
+        review_status: str = "unreviewed",
+        review_reason: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        draft_obj, draft_json = _normalize_work_draft_parse(draft_parse, raw_text)
+        confidence = str(draft_obj.get("confidence") or "low")
+        reason = review_reason or str(draft_obj.get("review_reason") or "draft_only_requires_hermis_review")
+        with self._connect() as db:
+            duplicate = _work_capture_duplicate(db, source, message_id)
+            if duplicate:
+                return {"status": "duplicate", "created": False, **duplicate}
+            capture_id = _insert_work_capture(
+                db,
+                local_date=local_date,
+                source=source,
+                message_id=message_id,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                logged_by=logged_by,
+                raw_text=raw_text,
+                draft_parse_json=draft_json,
+                confidence=confidence,
+                review_reason=reason,
+                review_status=review_status,
+                now=now,
+            )
+            record = _work_capture_record(
+                capture_id=capture_id,
+                local_date=local_date,
+                raw_text=raw_text,
+                draft_parse=draft_obj,
+                source=source,
+                message_id=message_id,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                logged_by=logged_by,
+                confidence=confidence,
+                review_reason=reason,
+                review_status=review_status,
+                now=now,
+            )
+            _insert_work_event(db, None, capture_id, "capture", record, local_date, now)
+            db.commit()
+
+        await self._append_daily_logs(self.work_dir, local_date, record, _work_md_row(record))
+        self._append_raw_work_capture(local_date, now, source, channel_name, message_id, review_status, raw_text)
+        await self.write_work_state_snapshot()
+        return {
+            "status": review_status,
+            "created": True,
+            "capture_id": capture_id,
+            "confidence": confidence,
+            "review_reason": reason,
+        }
+
+    async def add_manual_work_items(
+        self,
+        *,
+        local_date: str,
+        raw_text: str,
+        drafts,
+        draft_parse: dict[str, Any] | str,
+        message_id: int | None,
+        channel_id: int | None,
+        channel_name: str,
+        logged_by: int | None,
+        source: str = "discord_command",
+    ) -> dict[str, Any]:
+        capture = await self.log_work_capture(
+            local_date=local_date,
+            raw_text=raw_text,
+            draft_parse=draft_parse,
+            message_id=message_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            logged_by=logged_by,
+            source=source,
+            review_status="confirmed",
+            review_reason="manual_command_confirmed_by_user",
+        )
+        if not capture.get("created"):
+            return {**capture, "item_ids": []}
+        records = await self.confirm_work_capture(
+            int(capture["capture_id"]),
+            drafts,
+            review_note="manual_command_confirmed_by_user",
+        )
+        return {
+            "status": "confirmed",
+            "created": True,
+            "capture_id": capture["capture_id"],
+            "item_ids": [record["id"] for record in records],
+        }
+
+    async def confirm_work_capture(
+        self,
+        capture_id: int,
+        drafts,
+        *,
+        review_note: str = "hermis_review_confirmed",
+    ) -> list[dict[str, Any]]:
+        now = utc_now_iso()
+        draft_list = _work_draft_list(drafts)
+        if not draft_list:
+            raise ValueError("confirmed work captures require at least one item")
+        with self._connect() as db:
+            row = _fetchone(
+                db,
+                """
+                SELECT local_date, source, source_message_id, source_channel_id,
+                       source_channel_name, logged_by, raw_text, review_status,
+                       (SELECT COUNT(*) FROM work_items WHERE capture_id = work_captures.id)
+                FROM work_captures
+                WHERE id = ? AND review_status IN ('unreviewed', 'clarification', 'confirmed')
+                """,
+                (capture_id,),
+            )
+            if row is None:
+                return []
+            local_date, source, message_id, channel_id, channel_name, logged_by, raw_text, existing_status, item_count = row
+            if existing_status == "confirmed" and int(item_count) > 0:
+                return []
+            source_item_start = _next_work_source_item_index(db, capture_id)
+            records = []
+            for offset, draft in enumerate(draft_list):
+                source_item_index = source_item_start + offset
+                item_id = _insert_work_item(
+                    db,
+                    capture_id=capture_id,
+                    draft=draft,
+                    raw_text=raw_text,
+                    source=source,
+                    message_id=message_id,
+                    source_item_index=source_item_index,
+                    channel_id=channel_id,
+                    logged_by=logged_by,
+                    now=now,
+                )
+                record = _work_item_record(
+                    item_id=item_id,
+                    capture_id=capture_id,
+                    draft=draft,
+                    raw_text=raw_text,
+                    source=source,
+                    message_id=message_id,
+                    source_item_index=source_item_index,
+                    channel_id=channel_id,
+                    logged_by=logged_by,
+                    event="work_item_confirmed",
+                    now=now,
+                )
+                _insert_work_event(db, item_id, capture_id, "confirmed", record, local_date, now)
+                records.append(record)
+            db.execute(
+                """
+                UPDATE work_captures
+                SET review_status = 'confirmed',
+                    review_reason = ?,
+                    clarification_question = NULL,
+                    reviewed_at_utc = ?
+                WHERE id = ?
+                """,
+                (review_note, now, capture_id),
+            )
+            db.commit()
+
+        for record in records:
+            await self._append_daily_logs(self.work_dir, local_date, record, _work_md_row(record))
+        await self.write_work_state_snapshot()
+        return records
+
+    async def ask_work_clarification(self, capture_id: int, question: str) -> bool:
+        text = " ".join(str(question or "").split())
+        if not text:
+            raise ValueError("clarification question is required")
+        now = utc_now_iso()
+        with self._connect() as db:
+            row = _fetchone(
+                db,
+                "SELECT local_date, raw_text FROM work_captures WHERE id = ? AND review_status IN ('unreviewed', 'clarification')",
+                (capture_id,),
+            )
+            if row is None:
+                return False
+            local_date, raw_text = row
+            db.execute(
+                """
+                UPDATE work_captures
+                SET review_status = 'clarification',
+                    clarification_question = ?,
+                    review_reason = 'needs_clarification',
+                    reviewed_at_utc = ?
+                WHERE id = ?
+                """,
+                (text, now, capture_id),
+            )
+            record = {
+                "event": "work_capture_clarification",
+                "id": capture_id,
+                "local_date": local_date,
+                "raw_text": raw_text,
+                "question": text,
+                "status": "clarification",
+                "created_at_utc": now,
+            }
+            _insert_work_event(db, None, capture_id, "clarification", record, local_date, now)
+            db.commit()
+        await self._append_daily_logs(self.work_dir, local_date, record, _work_md_row(record))
+        await self.write_work_state_snapshot()
+        return True
+
+    async def ignore_work_capture(self, capture_id: int, reason: str) -> bool:
+        text = " ".join(str(reason or "").split())
+        if not text:
+            raise ValueError("ignored work captures require an explicit reason")
+        now = utc_now_iso()
+        with self._connect() as db:
+            row = _fetchone(
+                db,
+                "SELECT local_date, raw_text FROM work_captures WHERE id = ? AND review_status IN ('unreviewed', 'clarification')",
+                (capture_id,),
+            )
+            if row is None:
+                return False
+            local_date, raw_text = row
+            db.execute(
+                """
+                UPDATE work_captures
+                SET review_status = 'ignored',
+                    ignore_reason = ?,
+                    review_reason = 'ignored_after_review',
+                    reviewed_at_utc = ?
+                WHERE id = ?
+                """,
+                (text, now, capture_id),
+            )
+            record = {
+                "event": "work_capture_ignored",
+                "id": capture_id,
+                "local_date": local_date,
+                "raw_text": raw_text,
+                "reason": text,
+                "status": "ignored",
+                "created_at_utc": now,
+            }
+            _insert_work_event(db, None, capture_id, "ignored", record, local_date, now)
+            db.commit()
+        await self._append_daily_logs(self.work_dir, local_date, record, _work_md_row(record))
+        await self.write_work_state_snapshot()
+        return True
+
+    async def list_work_items(self, status: str = "active", limit: int = 12) -> list[dict[str, Any]]:
+        if status == "active":
+            where = "status IN ('open', 'waiting', 'blocked')"
+            params: tuple[Any, ...] = ()
+        else:
+            where = "status = ?"
+            params = (status,)
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                f"""
+                SELECT * FROM work_items
+                WHERE {where}
+                ORDER BY
+                    CASE status WHEN 'blocked' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
+                    CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
+                    CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
+                    due_date ASC,
+                    created_at_utc ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [_work_row_to_item(row) for row in rows]
+
+    async def list_work_today(self, local_date: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                """
+                SELECT * FROM work_items
+                WHERE status IN ('open', 'waiting', 'blocked')
+                  AND (due_date <= ? OR scheduled_date = ?)
+                ORDER BY
+                    CASE status WHEN 'blocked' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
+                    CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
+                    due_date ASC,
+                    created_at_utc ASC
+                LIMIT ?
+                """,
+                (local_date, local_date, limit),
+            ).fetchall()
+        return [_work_row_to_item(row) for row in rows]
+
+    async def work_focus_items(self, local_date: str, limit: int = 5) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        today = datetime.fromisoformat(f"{local_date}T00:00:00").date()
+        soon = (today + timedelta(days=2)).isoformat()
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            focus_rows = db.execute(
+                """
+                SELECT * FROM work_items
+                WHERE status = 'open'
+                  AND (priority IN ('p0', 'p1') OR due_date <= ? OR scheduled_date = ?)
+                ORDER BY
+                    CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
+                    CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
+                    due_date ASC,
+                    COALESCE(effort_minutes, 999) ASC,
+                    created_at_utc ASC
+                LIMIT ?
+                """,
+                (soon, local_date, limit),
+            ).fetchall()
+            waiting_rows = db.execute(
+                """
+                SELECT * FROM work_items
+                WHERE status IN ('blocked', 'waiting')
+                ORDER BY updated_at_utc DESC
+                LIMIT 5
+                """
+            ).fetchall()
+        focus = [_work_row_to_item(row) for row in focus_rows]
+        if len(focus) < limit:
+            more = await self.list_work_items("active", limit=limit * 3)
+            seen = {item["id"] for item in focus}
+            for item in more:
+                if item["status"] == "open" and item["id"] not in seen:
+                    focus.append(item)
+                    seen.add(item["id"])
+                if len(focus) >= limit:
+                    break
+        return focus, [_work_row_to_item(row) for row in waiting_rows]
+
+    async def list_work_reviews(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT id, local_date, review_status, review_reason, clarification_question,
+                       raw_text, confidence, created_at_utc
+                FROM work_captures
+                WHERE review_status IN ('unreviewed', 'clarification')
+                ORDER BY created_at_utc DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "local_date": row[1],
+                "review_status": row[2],
+                "review_reason": row[3],
+                "clarification_question": row[4],
+                "raw_text": row[5],
+                "confidence": row[6],
+                "created_at_utc": row[7],
+            }
+            for row in rows
+        ]
+
+    async def set_work_item_status(
+        self,
+        item_id: int,
+        status: str,
+        *,
+        local_date: str,
+        reason: str = "",
+        logged_by: int | None = None,
+    ) -> dict[str, Any] | None:
+        if status not in {"open", "waiting", "blocked", "done", "cancelled"}:
+            raise ValueError(f"Unsupported work status: {status}")
+        clean_reason = " ".join(str(reason or "").split())
+        if status in {"waiting", "blocked"} and not clean_reason:
+            raise ValueError(f"{status} work items require a reason")
+        now = utc_now_iso()
+        completed_at = now if status == "done" else None
+        cancelled_at = now if status == "cancelled" else None
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM work_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                return None
+            db.execute(
+                """
+                UPDATE work_items
+                SET status = ?,
+                    note = COALESCE(NULLIF(?, ''), note),
+                    updated_at_utc = ?,
+                    completed_at_utc = COALESCE(?, completed_at_utc),
+                    cancelled_at_utc = COALESCE(?, cancelled_at_utc)
+                WHERE id = ?
+                """,
+                (status, clean_reason, now, completed_at, cancelled_at, item_id),
+            )
+            updated = db.execute("SELECT * FROM work_items WHERE id = ?", (item_id,)).fetchone()
+            item = _work_row_to_item(updated)
+            payload = {
+                "event": f"work_item_{status}",
+                "id": item_id,
+                "capture_id": item.get("capture_id"),
+                "status": status,
+                "reason": clean_reason,
+                "logged_by": logged_by,
+                "created_at_utc": now,
+                **item,
+            }
+            _insert_work_event(db, item_id, item.get("capture_id"), status, payload, local_date, now)
+            db.commit()
+        await self._append_daily_logs(self.work_dir, local_date, payload, _work_md_row(payload))
+        await self.write_work_state_snapshot()
+        return item
+
+    async def write_work_state_snapshot(self) -> None:
+        if not self.db_path.exists():
+            return
+        active = await self.list_work_items("active", limit=80)
+        reviews = await self.list_work_reviews(limit=20)
+        now_items = [item for item in active if item["status"] == "open" and item["priority"] in {"p0", "p1"}]
+        next_items = [item for item in active if item["status"] == "open" and item["priority"] not in {"p0", "p1"}]
+        waiting = [item for item in active if item["status"] in {"blocked", "waiting"}]
+        lines = [
+            "# Work State",
+            "",
+            f"Generated: {utc_now_iso()}",
+            "Source: tracker DB work_items + work_captures",
+            "",
+            "## Now",
+        ]
+        lines.extend(_work_state_lines(now_items[:10]))
+        lines.extend(["", "## Next"])
+        lines.extend(_work_state_lines(next_items[:20]))
+        lines.extend(["", "## Blocked / Waiting"])
+        lines.extend(_work_state_lines(waiting[:20]))
+        lines.extend(["", "## Unreviewed / Unclear Captures"])
+        if reviews:
+            for review in reviews:
+                snippet = _snippet(review["raw_text"], 120)
+                detail = review["clarification_question"] or review["review_reason"]
+                lines.append(f"- capture:{review['id']} {review['review_status']} ({detail}): {snippet}")
+        else:
+            lines.append("- none")
+        lines.extend(
+            [
+                "",
+                "## Operating Rules",
+                "- Normal #work-tracker messages are capture-first and unconfirmed until Hermis review.",
+                "- Draft parse JSON is a hint only; it is not final task truth.",
+                "- Confirmed work follows the Casablanca work window: 14:00-23:00.",
+                "",
+            ]
+        )
+        (self.state_dir / "work.md").write_text("\n".join(lines), encoding="utf-8")
+
     async def log_finance_message(
         self,
         *,
@@ -874,6 +1404,30 @@ class TrackerStore:
         )
         _append_text(self.raw_capture_dir / f"{local_date}.md", block)
 
+    def _append_raw_work_capture(
+        self,
+        local_date: str,
+        timestamp_utc: str,
+        source: str,
+        channel_name: str,
+        message_id: int | None,
+        review_status: str,
+        raw_text: str,
+    ) -> None:
+        capture_id = f"work-{source}-{message_id or timestamp_utc.replace(':', '').replace('+', '')}"
+        processed = "true" if review_status == "confirmed" else "false"
+        block = (
+            "\n---\n\n"
+            f"capture_id: {capture_id}\n"
+            f"timestamp: {timestamp_utc}\n"
+            f"source: {source}:#{channel_name}\n"
+            "classification: work\n"
+            f"status: work_{review_status}\n"
+            f"processed: {processed}\n\n"
+            f"{raw_text}\n"
+        )
+        _append_text(self.raw_capture_dir / f"{local_date}.md", block)
+
     async def _append_daily_logs(
         self,
         directory: Path,
@@ -896,6 +1450,330 @@ def utc_now_iso() -> str:
 
 def _fetchone(db: sqlite3.Connection, query: str, params: tuple[Any, ...]):
     return db.execute(query, params).fetchone()
+
+
+def _normalize_work_draft_parse(draft_parse: dict[str, Any] | str, raw_text: str) -> tuple[dict[str, Any], str]:
+    if isinstance(draft_parse, str):
+        try:
+            parsed = json.loads(draft_parse)
+        except json.JSONDecodeError:
+            parsed = {
+                "status": "draft_parse",
+                "confidence": "low",
+                "review_reason": "invalid_draft_parse_json",
+                "candidates": [],
+                "raw_text": raw_text,
+            }
+    elif isinstance(draft_parse, dict):
+        parsed = dict(draft_parse)
+    else:
+        parsed = {
+            "status": "draft_parse",
+            "confidence": "low",
+            "review_reason": "missing_draft_parse",
+            "candidates": [],
+            "raw_text": raw_text,
+        }
+    parsed.setdefault("status", "draft_parse")
+    parsed.setdefault("confidence", "low")
+    parsed.setdefault("review_reason", "draft_only_requires_hermis_review")
+    parsed.setdefault("candidates", [])
+    parsed.setdefault("raw_text", raw_text)
+    return parsed, json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+
+
+def _work_capture_duplicate(db: sqlite3.Connection, source: str, message_id: int | None) -> dict[str, Any] | None:
+    if message_id is None:
+        return None
+    row = _fetchone(
+        db,
+        """
+        SELECT id, review_status
+        FROM work_captures
+        WHERE source = ? AND source_message_id = ?
+        """,
+        (source, message_id),
+    )
+    if row is not None:
+        item_rows = db.execute(
+            """
+            SELECT id FROM work_items
+            WHERE capture_id = ?
+            ORDER BY source_item_index, id
+            """,
+            (row[0],),
+        ).fetchall()
+        return {
+            "capture_id": row[0],
+            "review_status": row[1],
+            "item_ids": [item_row[0] for item_row in item_rows],
+        }
+    return None
+
+
+def _insert_work_capture(
+    db: sqlite3.Connection,
+    *,
+    local_date: str,
+    source: str,
+    message_id: int | None,
+    channel_id: int | None,
+    channel_name: str,
+    logged_by: int | None,
+    raw_text: str,
+    draft_parse_json: str,
+    confidence: str,
+    review_reason: str,
+    review_status: str,
+    now: str,
+) -> int:
+    cursor = db.execute(
+        """
+        INSERT INTO work_captures
+            (local_date, source, source_message_id, source_channel_id,
+             source_channel_name, logged_by, raw_text, draft_parse_json,
+             confidence, review_reason, review_status, created_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            local_date,
+            source,
+            message_id,
+            channel_id,
+            channel_name,
+            logged_by,
+            raw_text,
+            draft_parse_json,
+            confidence,
+            review_reason,
+            review_status,
+            now,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _work_capture_record(
+    *,
+    capture_id: int,
+    local_date: str,
+    raw_text: str,
+    draft_parse: dict[str, Any],
+    source: str,
+    message_id: int | None,
+    channel_id: int | None,
+    channel_name: str,
+    logged_by: int | None,
+    confidence: str,
+    review_reason: str,
+    review_status: str,
+    now: str,
+) -> dict[str, Any]:
+    return {
+        "event": "work_capture",
+        "id": capture_id,
+        "local_date": local_date,
+        "raw_text": raw_text,
+        "draft_parse": draft_parse,
+        "confidence": confidence,
+        "review_reason": review_reason,
+        "status": review_status,
+        "source": source,
+        "source_message_id": message_id,
+        "source_channel_id": channel_id,
+        "source_channel_name": channel_name,
+        "logged_by": logged_by,
+        "created_at_utc": now,
+    }
+
+
+def _work_draft_list(drafts) -> list[Any]:
+    if drafts is None:
+        return []
+    if isinstance(drafts, (list, tuple)):
+        return list(drafts)
+    return [drafts]
+
+
+def _draft_value(draft, key: str, default: Any = None) -> Any:
+    if isinstance(draft, dict):
+        return draft.get(key, default)
+    return getattr(draft, key, default)
+
+
+def _insert_work_item(
+    db: sqlite3.Connection,
+    *,
+    capture_id: int,
+    draft,
+    raw_text: str,
+    source: str,
+    message_id: int | None,
+    source_item_index: int,
+    channel_id: int | None,
+    logged_by: int | None,
+    now: str,
+) -> int:
+    tags = _draft_value(draft, "tags", ())
+    if isinstance(tags, str):
+        tags = [tags]
+    cursor = db.execute(
+        """
+        INSERT INTO work_items
+            (capture_id, title, status, priority, project, area, due_date,
+             scheduled_date, energy, effort_minutes, context, tags_json, note,
+             source, source_message_id, source_channel_id, logged_by, raw_text,
+             source_item_index, created_at_utc, updated_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            capture_id,
+            str(_draft_value(draft, "title") or "").strip(),
+            str(_draft_value(draft, "status", "open") or "open"),
+            str(_draft_value(draft, "priority", "p2") or "p2"),
+            _draft_value(draft, "project"),
+            _draft_value(draft, "area"),
+            _draft_value(draft, "due_date"),
+            _draft_value(draft, "scheduled_date"),
+            _draft_value(draft, "energy"),
+            _draft_value(draft, "effort_minutes"),
+            _draft_value(draft, "context"),
+            json.dumps(list(tags), sort_keys=True, ensure_ascii=False),
+            _draft_value(draft, "note"),
+            source,
+            message_id,
+            channel_id,
+            logged_by,
+            raw_text,
+            source_item_index,
+            now,
+            now,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _next_work_source_item_index(db: sqlite3.Connection, capture_id: int) -> int:
+    row = _fetchone(
+        db,
+        """
+        SELECT COALESCE(MAX(source_item_index), -1)
+        FROM work_items
+        WHERE capture_id = ?
+        """,
+        (capture_id,),
+    )
+    return int(row[0]) + 1 if row else 0
+
+
+def _insert_work_event(
+    db: sqlite3.Connection,
+    item_id: int | None,
+    capture_id: int | None,
+    event: str,
+    payload: dict[str, Any],
+    local_date: str,
+    now: str,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO work_item_events
+            (item_id, capture_id, event, payload_json, local_date, created_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (item_id, capture_id, event, json.dumps(payload, sort_keys=True, ensure_ascii=False), local_date, now),
+    )
+
+
+def _work_item_record(
+    *,
+    item_id: int,
+    capture_id: int,
+    draft,
+    raw_text: str,
+    source: str,
+    message_id: int | None,
+    source_item_index: int,
+    channel_id: int | None,
+    logged_by: int | None,
+    event: str,
+    now: str,
+) -> dict[str, Any]:
+    tags = _draft_value(draft, "tags", ())
+    if isinstance(tags, str):
+        tags = [tags]
+    return {
+        "event": event,
+        "id": item_id,
+        "capture_id": capture_id,
+        "title": str(_draft_value(draft, "title") or "").strip(),
+        "status": str(_draft_value(draft, "status", "open") or "open"),
+        "priority": str(_draft_value(draft, "priority", "p2") or "p2"),
+        "project": _draft_value(draft, "project"),
+        "area": _draft_value(draft, "area"),
+        "due_date": _draft_value(draft, "due_date"),
+        "scheduled_date": _draft_value(draft, "scheduled_date"),
+        "energy": _draft_value(draft, "energy"),
+        "effort_minutes": _draft_value(draft, "effort_minutes"),
+        "context": _draft_value(draft, "context"),
+        "tags": list(tags),
+        "note": _draft_value(draft, "note"),
+        "raw_text": raw_text,
+        "source": source,
+        "source_message_id": message_id,
+        "source_item_index": source_item_index,
+        "source_channel_id": channel_id,
+        "logged_by": logged_by,
+        "created_at_utc": now,
+        "updated_at_utc": now,
+    }
+
+
+def _work_row_to_item(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["tags"] = json.loads(item.pop("tags_json") or "[]")
+    except json.JSONDecodeError:
+        item["tags"] = []
+    return item
+
+
+def _work_state_lines(items: list[dict[str, Any]]) -> list[str]:
+    if not items:
+        return ["- none"]
+    lines = []
+    for item in items:
+        due = f" due {item['due_date']}" if item.get("due_date") else ""
+        scheduled = f" scheduled {item['scheduled_date']}" if item.get("scheduled_date") else ""
+        project = f" project:{item['project']}" if item.get("project") else ""
+        status = f" status:{item['status']}" if item.get("status") != "open" else ""
+        lines.append(
+            f"- #{item['id']} [{str(item.get('priority') or 'p2').upper()}]{due}{scheduled}{project}{status}: {item['title']}"
+        )
+    return lines
+
+
+def _work_md_row(record: dict[str, Any]) -> str:
+    logged_at = str(record.get("updated_at_utc") or record.get("created_at_utc") or utc_now_iso()).replace("+00:00", "Z")
+    title = str(
+        record.get("title")
+        or record.get("question")
+        or record.get("reason")
+        or record.get("raw_text")
+        or ""
+    ).replace("|", "\\|")
+    return (
+        f"| {logged_at} | {record.get('event')} | {record.get('id')} | "
+        f"{record.get('priority') or ''} | {record.get('status') or ''} | "
+        f"{title} | {record.get('due_date') or ''} |\n"
+    )
+
+
+def _snippet(text: str, limit: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
 
 
 def _ensure_finance_transaction_schema(db: sqlite3.Connection) -> None:
@@ -1334,6 +2212,9 @@ def _md_header(kind: str, local_date: str) -> str:
     elif kind == "finance":
         title = "Finance Log"
         columns = "| Time (UTC) | Event | ID | Kind | Amount | Category | Description | Status |\n|---|---|---:|---|---:|---|---|---|\n"
+    elif kind == "work":
+        title = "Work Log"
+        columns = "| Time (UTC) | Event | ID | Priority | Status | Title / Review | Due |\n|---|---|---:|---|---|---|---|\n"
     else:
         title = "Hydration Log"
         columns = "| Time (UTC) | Action | Delta | Total | Note | User |\n|---|---|---:|---:|---|---|\n"

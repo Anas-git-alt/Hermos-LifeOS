@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import date
@@ -21,9 +22,15 @@ from finance import finance_review_request, parse_finance_message
 from hydration import HYDRATION_REACTIONS, parse_hydration_footer
 from prayer import PRAYER_REACTIONS, parse_aladhan_timings, parse_prayer_footer
 from process_finance_reviews import apply_agent_result, apply_resolutions, fetch_reviews
+from process_work_reviews import (
+    apply_agent_result as apply_work_agent_result,
+    apply_resolutions as apply_work_resolutions,
+    fetch_captures,
+)
 from store import TrackerStore
 from summarize_finance_week import fetch_week
 from summarize_tracker_day import fetch_finance, render
+from work import draft_parse_work_message, item_from_manual_text
 
 
 ALADHAN_FIXTURE = {
@@ -592,6 +599,213 @@ class TrackerStoreTests(unittest.TestCase):
                 self.assertEqual(records[0]["source_item_index"], 1)
                 summary = await store.get_finance_day_summary("2026-04-30")
                 self.assertEqual(summary["expense_mad"], "65")
+
+        asyncio.run(run_case())
+
+    def test_work_capture_saves_raw_without_creating_confirmed_items(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "todo: send client update due:2026-05-04 p1 project:Hermis"
+                result = await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1001,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                self.assertTrue(result["created"])
+                with store._connect() as con:
+                    capture = con.execute(
+                        """
+                        SELECT raw_text, source, source_message_id, source_channel_id,
+                               draft_parse_json, review_status
+                        FROM work_captures
+                        """
+                    ).fetchone()
+                    item_count = con.execute("SELECT COUNT(*) FROM work_items").fetchone()[0]
+                self.assertEqual(capture[0], raw_text)
+                self.assertEqual(capture[1], "discord")
+                self.assertEqual(capture[2], 1001)
+                self.assertEqual(capture[3], 2002)
+                self.assertEqual(json.loads(capture[4])["status"], "draft_parse")
+                self.assertEqual(capture[5], "unreviewed")
+                self.assertEqual(item_count, 0)
+                raw_capture_file = root / "raw" / "captures" / "2026-05-03.md"
+                self.assertIn(raw_text, raw_capture_file.read_text(encoding="utf-8"))
+
+        asyncio.run(run_case())
+
+    def test_work_messy_capture_does_not_disappear(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "ugh maybe that client thing??"
+                await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1002,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                reviews = await store.list_work_reviews()
+                self.assertEqual(len(reviews), 1)
+                self.assertEqual(reviews[0]["raw_text"], raw_text)
+                self.assertEqual(reviews[0]["review_status"], "unreviewed")
+
+        asyncio.run(run_case())
+
+    def test_work_one_capture_can_become_multiple_confirmed_items(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "- send proposal\n- book kickoff call"
+                await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1003,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    captures = fetch_captures(con, "2026-05-03", False)
+                capture_id = captures[0]["id"]
+                confirmed, ignored, questions = apply_work_agent_result(
+                    {
+                        "confirmed": [
+                            {
+                                "capture_id": capture_id,
+                                "items": [
+                                    {"title": "Send proposal", "priority": "p1", "status": "open"},
+                                    {"title": "Book kickoff call", "priority": "p2", "status": "open"},
+                                ],
+                            }
+                        ],
+                        "ignored": [],
+                        "questions": [],
+                    },
+                    {capture_id: captures[0]},
+                )
+                self.assertEqual(ignored, [])
+                self.assertEqual(questions, [])
+                applied, applied_ignored, applied_questions = await apply_work_resolutions(
+                    store, confirmed, ignored, questions, False
+                )
+                self.assertEqual(applied_ignored, [])
+                self.assertEqual(applied_questions, [])
+                self.assertEqual(len(applied[0]["item_ids"]), 2)
+                active = await store.list_work_items("active")
+                self.assertEqual([item["title"] for item in active], ["Send proposal", "Book kickoff call"])
+
+        asyncio.run(run_case())
+
+    def test_work_unclear_capture_becomes_clarification_question(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "deal with the thing"
+                await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1004,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    captures = fetch_captures(con, "2026-05-03", False)
+                capture_id = captures[0]["id"]
+                confirmed, ignored, questions = apply_work_agent_result(
+                    {"confirmed": [], "ignored": [], "questions": [{"capture_id": capture_id, "question": "Which thing should this refer to?"}]},
+                    {capture_id: captures[0]},
+                )
+                await apply_work_resolutions(store, confirmed, ignored, questions, False)
+                reviews = await store.list_work_reviews()
+                self.assertEqual(reviews[0]["review_status"], "clarification")
+                self.assertEqual(reviews[0]["clarification_question"], "Which thing should this refer to?")
+                self.assertEqual(await store.list_work_items("active"), [])
+
+        asyncio.run(run_case())
+
+    def test_work_ignored_capture_requires_explicit_reason(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "not actually work, just venting"
+                await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1005,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    captures = fetch_captures(con, "2026-05-03", False)
+                capture_id = captures[0]["id"]
+                confirmed, ignored, questions = apply_work_agent_result(
+                    {"confirmed": [], "ignored": [{"capture_id": capture_id, "reason": ""}], "questions": []},
+                    {capture_id: captures[0]},
+                )
+                self.assertEqual(confirmed, [])
+                self.assertEqual(ignored, [])
+                self.assertEqual(len(questions), 1)
+
+                confirmed, ignored, questions = apply_work_agent_result(
+                    {"confirmed": [], "ignored": [{"capture_id": capture_id, "reason": "not an actionable work item"}], "questions": []},
+                    {capture_id: captures[0]},
+                )
+                await apply_work_resolutions(store, confirmed, ignored, questions, False)
+                with store._connect() as con:
+                    row = con.execute(
+                        "SELECT review_status, ignore_reason FROM work_captures WHERE id = ?",
+                        (capture_id,),
+                    ).fetchone()
+                    item_count = con.execute("SELECT COUNT(*) FROM work_items").fetchone()[0]
+                self.assertEqual(row, ("ignored", "not an actionable work item"))
+                self.assertEqual(item_count, 0)
+
+        asyncio.run(run_case())
+
+    def test_work_manual_add_is_explicit_confirmation(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "todo: send update due:2026-05-03 p1"
+                result = await store.add_manual_work_items(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    drafts=item_from_manual_text(raw_text, today=date(2026, 5, 3)),
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=1006,
+                    channel_id=2002,
+                    channel_name="daily-plan",
+                    logged_by=123,
+                )
+                self.assertEqual(result["status"], "confirmed")
+                self.assertEqual(len(result["item_ids"]), 1)
+                active = await store.list_work_items("active")
+                self.assertEqual(active[0]["title"], "send update")
 
         asyncio.run(run_case())
 
