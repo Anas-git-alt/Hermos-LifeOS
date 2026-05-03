@@ -20,7 +20,7 @@ from config import is_owner_id, parse_owner_ids
 from finance import finance_review_request, parse_finance_message
 from hydration import HYDRATION_REACTIONS, parse_hydration_footer
 from prayer import PRAYER_REACTIONS, parse_aladhan_timings, parse_prayer_footer
-from process_finance_reviews import apply_resolutions, deterministic_resolve, fetch_reviews
+from process_finance_reviews import apply_agent_result, apply_resolutions, fetch_reviews
 from store import TrackerStore
 from summarize_finance_week import fetch_week
 from summarize_tracker_day import fetch_finance, render
@@ -409,7 +409,35 @@ class TrackerStoreTests(unittest.TestCase):
                 )
                 with store._connect() as con:
                     reviews = fetch_reviews(con, "2026-04-30", False)
-                resolved, questions = deterministic_resolve(reviews)
+                resolved, questions = apply_agent_result(
+                    {
+                        "resolved": [
+                            {
+                                "review_id": reviews[0]["id"],
+                                "entries": [
+                                    {
+                                        "kind": "bill",
+                                        "amount": "300",
+                                        "currency": "MAD",
+                                        "category": "utilities",
+                                        "merchant": "wifi",
+                                        "description": "wifi bill",
+                                    },
+                                    {
+                                        "kind": "bill",
+                                        "amount": "100",
+                                        "currency": "MAD",
+                                        "category": "utilities",
+                                        "merchant": "wife phone",
+                                        "description": "wife phone bill",
+                                    },
+                                ],
+                            }
+                        ],
+                        "questions": [],
+                    },
+                    {int(review["id"]): review for review in reviews},
+                )
                 self.assertEqual(len(questions), 0)
                 applied = await apply_resolutions(store, resolved, False)
                 self.assertEqual(len(applied), 1)
@@ -418,6 +446,116 @@ class TrackerStoreTests(unittest.TestCase):
                     weekly = fetch_week(con, "2026-04-24", "2026-04-30")
                 self.assertEqual(weekly["expense_mad"], 400.0)
                 self.assertEqual(weekly["open_reviews"], [])
+
+        asyncio.run(run_case())
+
+    def test_finance_processor_uses_ai_json_for_multiline_review(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                await store.log_finance_message(
+                    local_date="2026-05-02",
+                    raw_text="-20 glovo prime subscription (2nd account)\n"
+                    "-10 cash moul msemen (3 msemna, 3 batbouta normal, 4 batbouta 3amra)\n"
+                    "-8 cash (2 khobza smida, 6 2x foure chocolat)\n"
+                    "-1 cash n3na3",
+                    parsed=finance_review_request(),
+                    message_id=778,
+                    channel_id=888,
+                    channel_name="finance-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    reviews = fetch_reviews(con, "2026-05-02", False)
+                resolved, questions = apply_agent_result(
+                    {
+                        "resolved": [
+                            {
+                                "review_id": reviews[0]["id"],
+                                "entries": [
+                                    {
+                                        "kind": "subscription",
+                                        "amount": "20",
+                                        "currency": "MAD",
+                                        "category": "subscriptions",
+                                        "merchant": "Glovo Prime",
+                                        "description": "Glovo Prime subscription for second account",
+                                    },
+                                    {
+                                        "kind": "expense",
+                                        "amount": "10",
+                                        "currency": "MAD",
+                                        "category": "groceries",
+                                        "merchant": "moul msemen",
+                                        "description": "cash breakfast breads from moul msemen",
+                                    },
+                                    {
+                                        "kind": "expense",
+                                        "amount": "8",
+                                        "currency": "MAD",
+                                        "category": "groceries",
+                                        "merchant": "bakery",
+                                        "description": "cash bread and chocolate pastries",
+                                    },
+                                    {
+                                        "kind": "expense",
+                                        "amount": "1",
+                                        "currency": "MAD",
+                                        "category": "groceries",
+                                        "merchant": "n3na3",
+                                        "description": "cash mint",
+                                    },
+                                ],
+                            }
+                        ],
+                        "questions": [],
+                    },
+                    {int(review["id"]): review for review in reviews},
+                )
+                self.assertEqual(questions, [])
+                applied = await apply_resolutions(store, resolved, False)
+                self.assertEqual(len(applied[0]["transaction_ids"]), 4)
+                summary = await store.get_finance_day_summary("2026-05-02")
+                self.assertEqual(summary["expense_mad"], "39")
+                self.assertEqual(summary["needs_review_count"], 0)
+
+        asyncio.run(run_case())
+
+    def test_finance_processor_rejects_malformed_ai_json_without_guessing(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                await store.log_finance_message(
+                    local_date="2026-04-30",
+                    raw_text="spent something unclear",
+                    parsed=finance_review_request(),
+                    message_id=779,
+                    channel_id=888,
+                    channel_name="finance-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    reviews = fetch_reviews(con, "2026-04-30", False)
+                reviews_by_id = {int(review["id"]): review for review in reviews}
+                resolved, questions = apply_agent_result(
+                    {"resolved": [{"review_id": reviews[0]["id"], "entries": [{"amount": "-5"}]}]},
+                    reviews_by_id,
+                )
+                self.assertEqual(resolved, [])
+                self.assertEqual(len(questions), 1)
+                applied = await apply_resolutions(store, resolved, False)
+                self.assertEqual(applied, [])
+                summary = await store.get_finance_day_summary("2026-04-30")
+                self.assertEqual(summary["transaction_count"], 0)
+                self.assertEqual(summary["needs_review_count"], 1)
+
+                resolved, questions = apply_agent_result({"resolved": [], "questions": []}, reviews_by_id)
+                self.assertEqual(resolved, [])
+                self.assertEqual(len(questions), 1)
 
         asyncio.run(run_case())
 

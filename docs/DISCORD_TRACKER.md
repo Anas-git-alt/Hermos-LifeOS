@@ -136,8 +136,10 @@ Weekly finance rollup should run:
 scripts/summarize_finance_week.py <week-ending-YYYY-MM-DD>
 ```
 
-`process_finance_reviews.py` resolves clear review items automatically and writes
-clarification questions only for unclear notes. Manual `!money edit` is fallback,
+`process_finance_reviews.py` is plumbing only: it fetches review rows, calls the
+Hermis AI finance resolver, validates the returned JSON, applies entries, and
+writes clarification questions only for unclear notes. It must not infer
+amounts/categories from raw human finance text. Manual `!money edit` is fallback,
 not normal workflow.
 
 Finance examples:
@@ -167,7 +169,7 @@ Finance memory policy:
 
 - Raw finance messages, tracker DB rows, and detailed daily logs stay local.
 - Hermes/OpenViking should use `wiki/domains/money.md`, nightly/weekly finance summaries, and approved curated money memories.
-- Durable money patterns go through `memory/review` before `memory/curated`.
+- Durable money patterns go through `memory/review` before `memory/curated`; safe high-confidence facts may be auto-promoted by the nightly memory review.
 - Weekly finance reports carry normal spend rollups. Daily reports mention finance only for commitments, promises to pay, or deadlines.
 
 ## Commands
