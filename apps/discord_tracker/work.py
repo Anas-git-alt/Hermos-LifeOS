@@ -43,7 +43,9 @@ class WorkItemDraft:
     project: str | None = None
     area: str | None = None
     due_date: str | None = None
+    due_at: str | None = None
     scheduled_date: str | None = None
+    scheduled_at: str | None = None
     energy: str | None = None
     effort_minutes: int | None = None
     context: str | None = None
@@ -199,6 +201,8 @@ def _parse_work_line(text: str, today: date) -> WorkItemDraft | None:
     if not title:
         return None
     due_date = _parse_due_date(lowered, today)
+    due_at = _parse_time_token(lowered, "due_at")
+    scheduled_at = _parse_time_token(lowered, "scheduled_at")
     return WorkItemDraft(
         title=title,
         priority=_parse_priority(lowered, due_date, today),
@@ -206,7 +210,9 @@ def _parse_work_line(text: str, today: date) -> WorkItemDraft | None:
         project=_parse_named_token(original, "project"),
         area=_parse_named_token(original, "area"),
         due_date=due_date,
+        due_at=due_at,
         scheduled_date=_parse_scheduled_date(lowered, today),
+        scheduled_at=scheduled_at,
         energy=_parse_energy(lowered),
         effort_minutes=_parse_effort_minutes(lowered),
         context=_parse_context(original),
@@ -276,6 +282,17 @@ def _parse_scheduled_date(lowered: str, today: date) -> str | None:
     return None
 
 
+def _parse_time_token(lowered: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}[:=]\s*(\d{{1,2}}):(\d{{2}})\b", lowered)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _parse_named_token(text: str, key: str) -> str | None:
     match = re.search(rf"\b{re.escape(key)}[:=]([^#@|;]+)", text, flags=re.IGNORECASE)
     if not match:
@@ -326,6 +343,7 @@ def _clean_title(text: str) -> str:
     title = re.sub(r"^(todo|task|work|next|mit|blocked|blocker|waiting|follow up)[:\s-]+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bpriority[:=]?\s*p?[0-3]\b|\bp[0-3]\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:due|by|deadline)[:\s]+20\d{2}-\d{2}-\d{2}\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(?:due_at|scheduled_at)[:=]\s*\d{1,2}:\d{2}\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:due|by|deadline)[:\s]+(?:today|tomorrow|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:today|tomorrow|eod|end of day)\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bschedule(?:d)?[:\s]+20\d{2}-\d{2}-\d{2}\b", "", title, flags=re.IGNORECASE)

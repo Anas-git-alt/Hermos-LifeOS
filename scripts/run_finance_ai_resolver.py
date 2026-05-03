@@ -86,7 +86,7 @@ def main() -> int:
     default_hermes = str(lifeos_alias) if lifeos_alias.exists() else "hermes"
     hermes = os.environ.get("HERMIS_FINANCE_AI_CMD", default_hermes)
     env = os.environ.copy()
-    env.setdefault("HERMES_HOME", "/home/ubuntu/.hermes/profiles/lifeos")
+    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
     completed = subprocess.run(
         [hermes, "-z", _prompt(payload)],
         text=True,

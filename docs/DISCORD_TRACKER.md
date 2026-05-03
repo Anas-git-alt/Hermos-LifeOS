@@ -36,6 +36,14 @@ HYDRATION_INTERVAL_MINUTES=90
 HYDRATION_TARGET_COUNT=8
 WORK_START_HOUR=14
 WORK_END_HOUR=23
+WORK_PREP_LEAD_MINUTES=60
+WORK_MID_SHIFT_CHECKIN_ENABLED=false
+WORK_SHUTDOWN_REVIEW_ENABLED=true
+WORK_REMINDER_LOOKAHEAD_MINUTES=30
+WORK_OVERDUE_GRACE_MINUTES=15
+HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos
+HERMIS_WORK_AI_CMD=/home/ubuntu/.local/bin/lifeos
+HERMIS_WORK_AUTOMATION_AI_CMD=/home/ubuntu/.local/bin/lifeos
 ```
 
 `DISCORD_OWNER_IDS` accepts comma-separated or space-separated numeric Discord user IDs. Only those users can log prayer and hydration reactions.
@@ -68,6 +76,8 @@ scripts/run_discord_tracker.sh
 ```
 
 The script creates `.venv-discord-tracker`, installs `apps/discord_tracker/requirements.txt`, and starts the bot.
+
+Work and finance AI subprocesses force `HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos`, so systemd or shell profile drift cannot switch the Hermes profile.
 
 ## Install systemd Service
 
@@ -180,8 +190,8 @@ Finance memory policy:
 
 Work capture watches owner messages in `#work-tracker` (or `WORK_CHANNEL_NAME`).
 Normal text is saved as a raw `work_captures` row with source metadata and
-`draft_parse_json`, then marked unreviewed. The bot does not turn normal work
-tracker messages into final tasks.
+`draft_parse_json`, then Hermis drafts a pending `work_ai_suggestions` row.
+The bot does not turn normal work tracker messages into final tasks.
 
 Nightly work automation should run:
 
@@ -191,13 +201,23 @@ scripts/process_work_reviews.py <YYYY-MM-DD> --all-open
 
 `process_work_reviews.py` mirrors the finance review safety model: it fetches
 unreviewed/unclear captures, calls the Hermis work reviewer, validates JSON,
-then confirms, corrects/splits, ignores with an explicit reason, or writes
-clarification questions. Only confirmed review output creates `work_items`.
+then creates pending AI suggestions for confirmed/split, ignored, or
+clarification outcomes. Only `!work accept suggestion:<id>` creates `work_items`
+or changes capture review state. `--apply` exists for explicit direct application.
 
 Work window:
 
 - Timezone: `Africa/Casablanca`
 - Window: `14:00-23:00`
+
+Work automation runs inside the same sidecar:
+
+- `13:00`: prep nudge, idempotent per day
+- `14:00`: start-of-shift plan, idempotent per day
+- During work: due/scheduled reminders, overdue blocker prompts, waiting follow-ups
+- `23:00`: shutdown review + `reports/work/YYYY-MM-DD-shutdown.md`, idempotent per day
+- Reminder identity is stored in `work_automation_events`; overdue blocker prompts also write `work_blocker_prompts`.
+- Automation messages call Hermis AI first. If AI fails, the sidecar sends the deterministic fallback and records `message_source=fallback`.
 
 See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
 
@@ -212,14 +232,24 @@ See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
 - `!money edit <id|tx:id|review:id> <corrected text>` updates a transaction or resolves a review. For reviews, corrected text can contain multiple lines.
 - `!money void <id|tx:id|review:id>` voids a transaction or review item.
 - `!work` shows today's confirmed work and open capture review count.
-- `!work add <text>` explicitly creates confirmed work from command text.
+- `!work add <text>` saves a capture and creates a pending AI suggestion.
 - `!work list` shows active confirmed work.
 - `!work today` shows confirmed work due or scheduled today.
 - `!work focus` shows a focus list for the 14:00-23:00 Casablanca work window.
+- `!work automation` shows automation settings and nudges sent today.
+- `!work plan` manually renders the start plan.
+- `!work shutdown` manually renders shutdown review and writes the shutdown report.
 - `!work done <id>` marks a confirmed item done.
 - `!work block <id> <reason>` marks a confirmed item blocked.
 - `!work wait <id> <reason>` marks a confirmed item waiting.
-- `!work review` shows confirmed work plus unreviewed/unclear captures.
+- `!work reschedule <id> <date/time>` moves a confirmed item. Examples: `2026-05-04`, `2026-05-04 16:30`, `16:30`.
+- `!work blocker <id> <reason>` logs a structured blocker and marks the item blocked.
+- `!work snooze <id> <duration>` suppresses nudges for an item. Examples: `30m`, `2h`.
+- `!work clarify capture:<id> <answer>` answers a capture clarification for Hermis re-review.
+- `!work review` shows confirmed work, pending AI suggestions, and unreviewed/unclear captures.
+- `!work accept suggestion:<id>` accepts a pending AI suggestion and applies it if it changes work state.
+- `!work correct suggestion:<id> <what to fix>` reruns AI with your correction and keeps the old suggestion as corrected.
+- `!work reject suggestion:<id> <reason>` rejects a pending AI suggestion. Reason is required.
 - `!testprayer [PrayerName]` posts a short test prayer embed for smoke testing reactions.
 
 ## Smoke Tests
@@ -233,8 +263,8 @@ See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
 7. React to a hydration reminder with `💧` or `🥤` and confirm the count updates.
 8. Post `spent 45 lunch` in `#finance-tracker` and confirm a Hermis review item is created.
 9. Post two lines of expenses in one message and confirm they stay as one review item.
-10. Post `send client update tomorrow` in `#work-tracker` and confirm a work capture is created, not a confirmed work item.
-11. Run `!work review` and confirm it shows confirmed work plus the unreviewed capture.
+10. Post `send client update tomorrow` in `#work-tracker` and confirm a work capture plus pending AI suggestion is created, not a confirmed work item.
+11. Run `!work review` and confirm it shows pending AI suggestions plus the unreviewed capture.
 12. Check `data/prayer/`, `data/hydration/`, `data/finance/`, and `data/work/` for daily `.jsonl` and `.md` files.
 13. Restart the systemd service and confirm it returns to `active (running)`.
 
@@ -252,6 +282,7 @@ Covered areas:
 - Hydration count updates and log file creation
 - Finance review-first capture, multi-entry resolution, storage, idempotency, edit, void, and summaries
 - Work review-first capture, draft parse isolation, multi-item confirmation, clarifications, ignored reasons, and commands storage
+- Work automation idempotency, due reminders, overdue blocker prompts, waiting follow-ups, clarification surfacing, and Casablanca work-window checks
 - AlAdhan response parsing using a fixture
 
 ## Troubleshooting

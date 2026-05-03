@@ -33,6 +33,13 @@ class TrackerConfig:
     hydration_target_count: int
     work_start_hour: int
     work_end_hour: int
+    work_prep_lead_minutes: int
+    work_mid_shift_checkin_enabled: bool
+    work_shutdown_review_enabled: bool
+    work_reminder_lookahead_minutes: int
+    work_overdue_grace_minutes: int
+    work_ai_cmd: str
+    work_automation_ai_cmd: str
 
 
 def parse_owner_ids(raw: str | None) -> frozenset[int]:
@@ -80,6 +87,13 @@ def _optional_int_env(name: str) -> int | None:
     return int(raw)
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_config() -> TrackerConfig:
     _load_env_file()
 
@@ -109,4 +123,11 @@ def load_config() -> TrackerConfig:
         hydration_target_count=_int_env("HYDRATION_TARGET_COUNT", 8),
         work_start_hour=_int_env("WORK_START_HOUR", 14),
         work_end_hour=_int_env("WORK_END_HOUR", 23),
+        work_prep_lead_minutes=_int_env("WORK_PREP_LEAD_MINUTES", 60),
+        work_mid_shift_checkin_enabled=_bool_env("WORK_MID_SHIFT_CHECKIN_ENABLED", False),
+        work_shutdown_review_enabled=_bool_env("WORK_SHUTDOWN_REVIEW_ENABLED", True),
+        work_reminder_lookahead_minutes=_int_env("WORK_REMINDER_LOOKAHEAD_MINUTES", 30),
+        work_overdue_grace_minutes=_int_env("WORK_OVERDUE_GRACE_MINUTES", 15),
+        work_ai_cmd=os.getenv("HERMIS_WORK_AI_CMD", ""),
+        work_automation_ai_cmd=os.getenv("HERMIS_WORK_AUTOMATION_AI_CMD", ""),
     )

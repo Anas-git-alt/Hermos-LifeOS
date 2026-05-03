@@ -8,7 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--all-open", action="store_true", help="Process all unreviewed/unclear work captures.")
     parser.add_argument("--dry-run", action="store_true", help="Write report without applying changes.")
+    parser.add_argument("--apply", action="store_true", help="Apply AI output directly. Default creates pending AI suggestions only.")
     parser.add_argument(
         "--output",
         default=None,
@@ -146,7 +147,9 @@ def agent_payload(day: str, captures: list[dict[str, Any]]) -> dict[str, Any]:
                             "project": "optional",
                             "area": "optional",
                             "due_date": "optional YYYY-MM-DD",
+                            "due_at": "optional HH:MM",
                             "scheduled_date": "optional YYYY-MM-DD",
+                            "scheduled_at": "optional HH:MM",
                             "energy": "optional low|medium|high",
                             "effort_minutes": "optional integer",
                             "context": "optional",
@@ -166,6 +169,8 @@ def agent_payload(day: str, captures: list[dict[str, Any]]) -> dict[str, Any]:
 def run_agent(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not config.agent_cmd or not payload.get("captures"):
         return None
+    env = os.environ.copy()
+    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
     completed = subprocess.run(
         config.agent_cmd,
         input=json.dumps(payload, ensure_ascii=False),
@@ -173,6 +178,7 @@ def run_agent(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
         shell=True,
         check=False,
         capture_output=True,
+        env=env,
     )
     if completed.returncode != 0:
         return {"error": completed.stderr.strip() or f"agent exited {completed.returncode}"}
@@ -208,6 +214,19 @@ def _optional_int(value: Any, field: str) -> int | None:
     return parsed
 
 
+def _optional_time(value: Any, field: str) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        hour, minute = (int(part) for part in text.split(":", 1))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be HH:MM") from exc
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{field} must be HH:MM")
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _validate_item(raw: Any) -> WorkItemDraft:
     if not isinstance(raw, dict):
         raise ValueError("item must be an object")
@@ -232,7 +251,9 @@ def _validate_item(raw: Any) -> WorkItemDraft:
         project=_optional_text(raw.get("project")),
         area=_optional_text(raw.get("area")),
         due_date=_optional_date(raw.get("due_date"), "due_date"),
+        due_at=_optional_time(raw.get("due_at"), "due_at"),
         scheduled_date=_optional_date(raw.get("scheduled_date"), "scheduled_date"),
+        scheduled_at=_optional_time(raw.get("scheduled_at"), "scheduled_at"),
         energy=_optional_text(raw.get("energy")),
         effort_minutes=_optional_int(raw.get("effort_minutes"), "effort_minutes"),
         context=_optional_text(raw.get("context")),
@@ -334,6 +355,93 @@ async def apply_resolutions(store: TrackerStore, confirmed, ignored, questions, 
     return applied_confirmed, applied_ignored, applied_questions
 
 
+async def create_ai_suggestions(store: TrackerStore, captures_by_id, confirmed, ignored, questions, dry_run: bool):
+    created = []
+    for capture_id, drafts in confirmed:
+        capture = captures_by_id.get(int(capture_id))
+        if not capture:
+            continue
+        response = {
+            "outcome": "confirmed",
+            "confidence": "medium",
+            "review_reason": "nightly_ai_suggestion",
+            "items": [asdict(draft) for draft in drafts],
+        }
+        if await store.work_ai_pending_exists("capture_parse", "capture", int(capture_id)):
+            created.append({"capture_id": capture_id, "suggestion_id": "existing", "outcome": "confirmed"})
+            continue
+        if dry_run:
+            created.append({"capture_id": capture_id, "suggestion_id": None, "outcome": "confirmed"})
+            continue
+        suggestion_id = await store.create_work_ai_suggestion(
+            suggestion_kind="capture_parse",
+            source_type="capture",
+            source_id=int(capture_id),
+            local_date=capture["local_date"],
+            prompt={"source": "process_work_reviews", "capture": capture},
+            response=response,
+            confidence="medium",
+            review_reason="nightly_ai_suggestion",
+        )
+        created.append({"capture_id": capture_id, "suggestion_id": suggestion_id, "outcome": "confirmed"})
+    for capture_id, reason in ignored:
+        capture = captures_by_id.get(int(capture_id))
+        if not capture:
+            continue
+        response = {
+            "outcome": "ignored",
+            "confidence": "medium",
+            "review_reason": "nightly_ai_suggestion",
+            "reason": reason,
+        }
+        if await store.work_ai_pending_exists("capture_parse", "capture", int(capture_id)):
+            created.append({"capture_id": capture_id, "suggestion_id": "existing", "outcome": "ignored"})
+            continue
+        if dry_run:
+            created.append({"capture_id": capture_id, "suggestion_id": None, "outcome": "ignored"})
+            continue
+        suggestion_id = await store.create_work_ai_suggestion(
+            suggestion_kind="capture_parse",
+            source_type="capture",
+            source_id=int(capture_id),
+            local_date=capture["local_date"],
+            prompt={"source": "process_work_reviews", "capture": capture},
+            response=response,
+            confidence="medium",
+            review_reason="nightly_ai_suggestion",
+        )
+        created.append({"capture_id": capture_id, "suggestion_id": suggestion_id, "outcome": "ignored"})
+    for item in questions:
+        capture_id = int(item["capture_id"])
+        capture = captures_by_id.get(capture_id)
+        if not capture:
+            continue
+        response = {
+            "outcome": "questions",
+            "confidence": "medium",
+            "review_reason": "nightly_ai_suggestion",
+            "question": item["question"],
+        }
+        if await store.work_ai_pending_exists("capture_parse", "capture", capture_id):
+            created.append({"capture_id": capture_id, "suggestion_id": "existing", "outcome": "questions"})
+            continue
+        if dry_run:
+            created.append({"capture_id": capture_id, "suggestion_id": None, "outcome": "questions"})
+            continue
+        suggestion_id = await store.create_work_ai_suggestion(
+            suggestion_kind="capture_parse",
+            source_type="capture",
+            source_id=capture_id,
+            local_date=capture["local_date"],
+            prompt={"source": "process_work_reviews", "capture": capture},
+            response=response,
+            confidence="medium",
+            review_reason="nightly_ai_suggestion",
+        )
+        created.append({"capture_id": capture_id, "suggestion_id": suggestion_id, "outcome": "questions"})
+    return created
+
+
 def write_questions(config: Config, day: str, questions: list[dict[str, Any]]) -> Path | None:
     if not questions:
         return None
@@ -352,6 +460,7 @@ def render_report(
     confirmed,
     ignored,
     questions,
+    suggestions,
     agent_error: str | None,
     question_path: Path | None,
 ) -> str:
@@ -363,6 +472,7 @@ def render_report(
         f"- Captures confirmed: {len(confirmed)}",
         f"- Captures ignored: {len(ignored)}",
         f"- Clarifications needed: {len(questions)}",
+        f"- Pending AI suggestions created: {len(suggestions)}",
     ]
     if agent_error:
         lines.append(f"- AI reviewer issue: {agent_error}")
@@ -391,12 +501,20 @@ def render_report(
     else:
         lines.append("- none")
 
+    lines.extend(["", "## Pending AI Suggestions"])
+    if suggestions:
+        for item in suggestions:
+            sid = item["suggestion_id"] or "dry-run"
+            lines.append(f"- suggestion:{sid} capture:{item['capture_id']} outcome:{item['outcome']}")
+    else:
+        lines.append("- none")
+
     lines.extend(
         [
             "",
             "## Policy",
-            "- Work Discord input is review-first: raw capture and draft parse first, confirmed work item only after Hermis review.",
-            "- Draft parse JSON is a hint only and must not be treated as final truth.",
+            "- Work Discord input is AI-first and review-gated: raw capture, draft parse, pending AI suggestion, then human accept/correct/reject.",
+            "- Draft parse JSON and AI suggestions are hints only and must not be treated as final truth.",
             "- Ignored captures require explicit reasons.",
             "- Work window: 14:00-23:00 Africa/Casablanca.",
             "",
@@ -437,14 +555,25 @@ async def main_async() -> int:
             for capture in captures
         ]
 
-    applied_confirmed, applied_ignored, applied_questions = await apply_resolutions(
-        store,
-        confirmed,
-        ignored,
-        questions,
-        args.dry_run,
-    )
-    question_path = write_questions(config, day, applied_questions)
+    if args.apply:
+        applied_confirmed, applied_ignored, applied_questions = await apply_resolutions(
+            store,
+            confirmed,
+            ignored,
+            questions,
+            args.dry_run,
+        )
+        suggestions = []
+        question_path = write_questions(config, day, applied_questions)
+    else:
+        applied_confirmed = [
+            {"capture_id": capture_id, "item_ids": [], "items": drafts}
+            for capture_id, drafts in confirmed
+        ]
+        applied_ignored = [{"capture_id": capture_id, "reason": reason} for capture_id, reason in ignored]
+        applied_questions = questions
+        suggestions = await create_ai_suggestions(store, captures_by_id, confirmed, ignored, questions, args.dry_run)
+        question_path = None
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         render_report(
@@ -453,6 +582,7 @@ async def main_async() -> int:
             applied_confirmed,
             applied_ignored,
             applied_questions,
+            suggestions,
             agent_error,
             question_path,
         ),

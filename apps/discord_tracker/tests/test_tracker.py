@@ -4,7 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,7 +17,8 @@ SCRIPTS_DIR = ROOT_DIR / "scripts"
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from config import is_owner_id, parse_owner_ids
+from bot import DiscordTracker
+from config import TrackerConfig, is_owner_id, parse_owner_ids
 from finance import finance_review_request, parse_finance_message
 from hydration import HYDRATION_REACTIONS, parse_hydration_footer
 from prayer import PRAYER_REACTIONS, parse_aladhan_timings, parse_prayer_footer
@@ -25,12 +26,13 @@ from process_finance_reviews import apply_agent_result, apply_resolutions, fetch
 from process_work_reviews import (
     apply_agent_result as apply_work_agent_result,
     apply_resolutions as apply_work_resolutions,
+    create_ai_suggestions as create_work_ai_suggestions,
     fetch_captures,
 )
 from store import TrackerStore
 from summarize_finance_week import fetch_week
 from summarize_tracker_day import fetch_finance, render
-from work import draft_parse_work_message, item_from_manual_text
+from work import WorkItemDraft, draft_parse_work_message, item_from_manual_text
 
 
 ALADHAN_FIXTURE = {
@@ -48,6 +50,54 @@ ALADHAN_FIXTURE = {
         }
     },
 }
+
+
+class _FakeDiscordMessage:
+    def __init__(self, message_id: int):
+        self.id = message_id
+
+
+class _FakeDiscordChannel:
+    id = 999
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send(self, content=None, **_kwargs):
+        self.sent.append(content or "")
+        return _FakeDiscordMessage(7000 + len(self.sent))
+
+
+def _tracker_config(root: Path) -> TrackerConfig:
+    return TrackerConfig(
+        discord_bot_token="token",
+        discord_guild_id=None,
+        discord_owner_ids=frozenset({123}),
+        prayer_channel_name="prayer-tracker",
+        hydration_channel_name="habits",
+        finance_channel_name="finance-tracker",
+        work_channel_name="work-tracker",
+        lifeos_root=root,
+        tracker_db=root / "tracker.db",
+        timezone="Africa/Casablanca",
+        prayer_city="Casablanca",
+        prayer_country="Morocco",
+        prayer_method=21,
+        prayer_close_nudge_minutes=10,
+        hydration_start_hour=9,
+        hydration_end_hour=22,
+        hydration_interval_minutes=90,
+        hydration_target_count=8,
+        work_start_hour=14,
+        work_end_hour=23,
+        work_prep_lead_minutes=60,
+        work_mid_shift_checkin_enabled=False,
+        work_shutdown_review_enabled=True,
+        work_reminder_lookahead_minutes=30,
+        work_overdue_grace_minutes=15,
+        work_ai_cmd="",
+        work_automation_ai_cmd="",
+    )
 
 
 class TrackerUnitTests(unittest.TestCase):
@@ -808,6 +858,401 @@ class TrackerStoreTests(unittest.TestCase):
                 self.assertEqual(active[0]["title"], "send update")
 
         asyncio.run(run_case())
+
+    def test_work_ai_draft_created_but_not_confirmed_until_accept(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "send client update"
+                capture = await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=3001,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                suggestion_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=capture["capture_id"],
+                    local_date="2026-05-03",
+                    prompt={"raw_text": raw_text},
+                    response={
+                        "outcome": "confirmed",
+                        "confidence": "high",
+                        "review_reason": "clear_action",
+                        "items": [{"title": "Send client update", "priority": "p1", "status": "open"}],
+                    },
+                )
+                with store._connect() as con:
+                    self.assertEqual(con.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 0)
+                    self.assertEqual(con.execute("SELECT status FROM work_ai_suggestions").fetchone()[0], "pending")
+                result = await store.accept_work_ai_suggestion(suggestion_id)
+                self.assertEqual(result["action"], "confirmed")
+                active = await store.list_work_items("active")
+                self.assertEqual([item["title"] for item in active], ["Send client update"])
+
+        asyncio.run(run_case())
+
+    def test_work_ai_correction_keeps_old_and_creates_new_pending(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                old_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=10,
+                    local_date="2026-05-03",
+                    prompt={"raw_text": "fix thing"},
+                    response={"outcome": "questions", "question": "Which thing?", "confidence": "low", "review_reason": "unclear"},
+                )
+                self.assertTrue(await store.mark_work_ai_suggestion_corrected(old_id, "It means staging login."))
+                new_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=10,
+                    local_date="2026-05-03",
+                    prompt={"raw_text": "fix thing", "correction_note": "It means staging login."},
+                    response={
+                        "outcome": "confirmed",
+                        "items": [{"title": "Fix staging login", "priority": "p1", "status": "open"}],
+                    },
+                    supersedes_suggestion_id=old_id,
+                )
+                old = await store.get_work_ai_suggestion(old_id)
+                new = await store.get_work_ai_suggestion(new_id)
+                self.assertEqual(old["status"], "corrected")
+                self.assertEqual(old["reviewer_note"], "It means staging login.")
+                self.assertEqual(new["status"], "pending")
+                self.assertEqual(new["supersedes_suggestion_id"], old_id)
+
+        asyncio.run(run_case())
+
+    def test_work_ai_reject_requires_reason(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                suggestion_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=1,
+                    local_date="2026-05-03",
+                    prompt={},
+                    response={"outcome": "ignored", "reason": "noise"},
+                )
+                with self.assertRaises(ValueError):
+                    await store.reject_work_ai_suggestion(suggestion_id, "")
+                self.assertTrue(await store.reject_work_ai_suggestion(suggestion_id, "wrong capture"))
+                suggestion = await store.get_work_ai_suggestion(suggestion_id)
+                self.assertEqual(suggestion["status"], "rejected")
+
+        asyncio.run(run_case())
+
+    def test_work_ai_suggestion_can_split_one_capture_on_accept(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                raw_text = "send proposal and book kickoff"
+                capture = await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text=raw_text,
+                    draft_parse=draft_parse_work_message(raw_text, today=date(2026, 5, 3)),
+                    message_id=3002,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                suggestion_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=capture["capture_id"],
+                    local_date="2026-05-03",
+                    prompt={"raw_text": raw_text},
+                    response={
+                        "outcome": "confirmed",
+                        "items": [
+                            {"title": "Send proposal", "priority": "p1", "status": "open"},
+                            {"title": "Book kickoff", "priority": "p2", "status": "open"},
+                        ],
+                    },
+                )
+                result = await store.accept_work_ai_suggestion(suggestion_id)
+                self.assertEqual(len(result["item_ids"]), 2)
+                active = await store.list_work_items("active")
+                self.assertEqual([item["title"] for item in active], ["Send proposal", "Book kickoff"])
+
+        asyncio.run(run_case())
+
+    def test_nightly_ai_suggestions_are_not_duplicated(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                capture = await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text="send update",
+                    draft_parse=draft_parse_work_message("send update", today=date(2026, 5, 3)),
+                    message_id=3010,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                captures_by_id = {capture["capture_id"]: {"id": capture["capture_id"], "local_date": "2026-05-03", "raw_text": "send update"}}
+                confirmed = [(capture["capture_id"], (WorkItemDraft(title="Send update", priority="p1"),))]
+                first = await create_work_ai_suggestions(store, captures_by_id, confirmed, [], [], False)
+                second = await create_work_ai_suggestions(store, captures_by_id, confirmed, [], [], False)
+                self.assertIsInstance(first[0]["suggestion_id"], int)
+                self.assertEqual(second[0]["suggestion_id"], "existing")
+                suggestions = await store.list_work_ai_suggestions("pending")
+                self.assertEqual(len(suggestions), 1)
+
+        asyncio.run(run_case())
+
+    def test_work_ai_question_accept_opens_clarification(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                capture = await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text="fix that thing",
+                    draft_parse=draft_parse_work_message("fix that thing", today=date(2026, 5, 3)),
+                    message_id=3003,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                suggestion_id = await store.create_work_ai_suggestion(
+                    suggestion_kind="capture_parse",
+                    source_type="capture",
+                    source_id=capture["capture_id"],
+                    local_date="2026-05-03",
+                    prompt={},
+                    response={"outcome": "questions", "question": "Which thing did you mean?"},
+                )
+                await store.accept_work_ai_suggestion(suggestion_id)
+                questions = await store.work_clarifications()
+                self.assertEqual(questions[0]["question"], "Which thing did you mean?")
+
+        asyncio.run(run_case())
+
+    def test_work_prep_start_shutdown_automation_send_once_per_day(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                for kind in ("work_prep", "work_start", "work_shutdown"):
+                    first = await store.record_work_automation_event(
+                        kind=kind,
+                        local_date="2026-05-03",
+                        reminder_id=f"{kind}-2026-05-03",
+                        payload={"kind": kind},
+                    )
+                    second = await store.record_work_automation_event(
+                        kind=kind,
+                        local_date="2026-05-03",
+                        reminder_id=f"{kind}-2026-05-03",
+                        payload={"kind": kind},
+                    )
+                    self.assertTrue(first)
+                    self.assertFalse(second)
+                events = await store.work_automation_status("2026-05-03")
+                self.assertEqual(len(events), 3)
+
+        asyncio.run(run_case())
+
+    def test_work_automation_uses_ai_text_when_valid(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+
+                async def fake_named_channel(_name):
+                    return channel
+
+                async def fake_ai(_prompt, *, automation):
+                    return {"message": "AI says: start with #42 for 10 minutes.", "confidence": "high", "review_reason": "clear_next_action"}
+
+                bot._named_channel = fake_named_channel
+                bot._run_work_ai_json = fake_ai
+                await bot._send_work_automation_message(
+                    kind="work_start",
+                    local_date="2026-05-03",
+                    reminder_id="start-2026-05-03",
+                    text="Fallback start plan",
+                    payload={"first_action": {"id": 42, "title": "Send update"}},
+                )
+                self.assertEqual(channel.sent[0], "AI says: start with #42 for 10 minutes.")
+                suggestions = await store.list_work_ai_suggestions("pending")
+                self.assertEqual(suggestions[0]["suggestion_kind"], "automation_message")
+                events = await store.work_automation_status("2026-05-03")
+                self.assertEqual(len(events), 1)
+
+        asyncio.run(run_case())
+
+    def test_work_automation_falls_back_when_ai_fails(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+
+                async def fake_named_channel(_name):
+                    return channel
+
+                async def fake_ai(_prompt, *, automation):
+                    raise RuntimeError("AI unavailable")
+
+                bot._named_channel = fake_named_channel
+                bot._run_work_ai_json = fake_ai
+                await bot._send_work_automation_message(
+                    kind="work_start",
+                    local_date="2026-05-03",
+                    reminder_id="start-2026-05-03",
+                    text="Fallback start plan",
+                    payload={"first_action": None},
+                )
+                self.assertEqual(channel.sent[0], "Fallback start plan")
+                suggestions = await store.list_work_ai_suggestions("pending")
+                self.assertEqual(suggestions[0]["confidence"], "fallback")
+                with store._connect() as con:
+                    payload = json.loads(con.execute("SELECT payload_json FROM work_automation_events").fetchone()[0])
+                self.assertEqual(payload["message_source"], "fallback")
+
+        asyncio.run(run_case())
+
+    def test_work_due_reminder_idempotency_and_restart_safe(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                result = await store.add_manual_work_items(
+                    local_date="2026-05-03",
+                    raw_text="status update",
+                    drafts=[WorkItemDraft(title="Send status update", priority="p1", due_date="2026-05-03", due_at="15:00", effort_minutes=20)],
+                    draft_parse=draft_parse_work_message("status update", today=date(2026, 5, 3)),
+                    message_id=2001,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                now_local = datetime(2026, 5, 3, 14, 45, tzinfo=ZoneInfo("Africa/Casablanca"))
+                items = await store.work_due_reminder_items(local_date="2026-05-03", now_local=now_local, lookahead_minutes=30)
+                self.assertEqual([item["id"] for item in items], result["item_ids"])
+                reminder_id = f"due-{result['item_ids'][0]}-2026-05-03-15:00"
+                self.assertTrue(await store.record_work_automation_event(kind="work_due", local_date="2026-05-03", reminder_id=reminder_id, payload={}))
+                self.assertFalse(await store.record_work_automation_event(kind="work_due", local_date="2026-05-03", reminder_id=reminder_id, payload={}))
+
+        asyncio.run(run_case())
+
+    def test_work_overdue_creates_blocker_prompt_without_spam(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                result = await store.add_manual_work_items(
+                    local_date="2026-05-03",
+                    raw_text="send status update",
+                    drafts=[WorkItemDraft(title="Send status update", priority="p1", due_date="2026-05-03", due_at="14:00")],
+                    draft_parse=draft_parse_work_message("send status update", today=date(2026, 5, 3)),
+                    message_id=2011,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                now_local = datetime(2026, 5, 3, 14, 20, tzinfo=ZoneInfo("Africa/Casablanca"))
+                overdue = await store.overdue_work_items(local_date="2026-05-03", now_local=now_local, grace_minutes=15)
+                self.assertEqual([item["id"] for item in overdue], result["item_ids"])
+                item_id = result["item_ids"][0]
+                self.assertTrue(await store.create_work_blocker_prompt(item_id=item_id, local_date="2026-05-03", reason="overdue"))
+                self.assertFalse(await store.create_work_blocker_prompt(item_id=item_id, local_date="2026-05-03", reason="overdue"))
+
+        asyncio.run(run_case())
+
+    def test_work_waiting_followup_and_snooze(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                result = await store.add_manual_work_items(
+                    local_date="2026-05-03",
+                    raw_text="wait for reply",
+                    drafts=[WorkItemDraft(title="Wait for Youssef reply", priority="p2")],
+                    draft_parse=draft_parse_work_message("wait for reply", today=date(2026, 5, 3)),
+                    message_id=2021,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                item_id = result["item_ids"][0]
+                await store.set_work_item_status(item_id, "waiting", local_date="2026-05-03", reason="waiting on Youssef")
+                with store._connect() as con:
+                    con.execute("UPDATE work_items SET next_followup_at = ? WHERE id = ?", ("2026-05-03T10:00:00+00:00", item_id))
+                    con.commit()
+                due = await store.waiting_followup_items(datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc))
+                self.assertEqual([item["id"] for item in due], [item_id])
+                await store.snooze_work_item(item_id, datetime(2026, 5, 3, 13, 0, tzinfo=timezone.utc), local_date="2026-05-03")
+                snoozed = await store.waiting_followup_items(datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc))
+                self.assertEqual(snoozed, [])
+
+        asyncio.run(run_case())
+
+    def test_work_clarification_question_text_is_available_for_automation(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                await store.log_work_capture(
+                    local_date="2026-05-03",
+                    raw_text="fix that thing from yesterday",
+                    draft_parse=draft_parse_work_message("fix that thing from yesterday", today=date(2026, 5, 3)),
+                    message_id=2031,
+                    channel_id=2002,
+                    channel_name="work-tracker",
+                    logged_by=123,
+                )
+                with store._connect() as con:
+                    capture_id = con.execute("SELECT id FROM work_captures").fetchone()[0]
+                await store.ask_work_clarification(capture_id, "Which staging issue did you mean?")
+                questions = await store.work_clarifications()
+                self.assertEqual(questions[0]["question"], "Which staging issue did you mean?")
+                self.assertIn("fix that thing", questions[0]["raw_text"])
+                self.assertTrue(await store.answer_work_clarification(capture_id, "The staging login timeout."))
+                reviews = await store.list_work_reviews()
+                self.assertEqual(reviews[0]["review_status"], "unreviewed")
+
+        asyncio.run(run_case())
+
+    def test_work_automation_respects_casablanca_window_times(self) -> None:
+        tz = ZoneInfo("Africa/Casablanca")
+        start = datetime.combine(date(2026, 5, 3), datetime.min.time().replace(hour=14), tzinfo=tz)
+        prep = start - timedelta(minutes=60)
+        shutdown = datetime.combine(date(2026, 5, 3), datetime.min.time().replace(hour=23), tzinfo=tz)
+        self.assertEqual(prep.strftime("%H:%M"), "13:00")
+        self.assertEqual(start.strftime("%H:%M"), "14:00")
+        self.assertEqual(shutdown.strftime("%H:%M"), "23:00")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1727 @@
+diff --git a/apps/discord_tracker/work.py b/apps/discord_tracker/work.py
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/apps/discord_tracker/work.py
+@@ -0,0 +1,315 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from datetime import date, timedelta
++from typing import Any
++
++
++PRIORITIES = ("p0", "p1", "p2", "p3")
++STATUSES = ("open", "waiting", "blocked", "done", "cancelled")
++PRIORITY_LABELS = {
++    "p0": "urgent / must move now",
++    "p1": "important / next",
++    "p2": "normal / scheduled",
++    "p3": "backlog / someday",
++}
++WEEKDAYS = {
++    "mon": 0,
++    "monday": 0,
++    "tue": 1,
++    "tues": 1,
++    "tuesday": 1,
++    "wed": 2,
++    "wednesday": 2,
++    "thu": 3,
++    "thur": 3,
++    "thurs": 3,
++    "thursday": 3,
++    "fri": 4,
++    "friday": 4,
++    "sat": 5,
++    "saturday": 5,
++    "sun": 6,
++    "sunday": 6,
++}
++
++
++@dataclass(frozen=True)
++class WorkItemDraft:
++    title: str
++    priority: str = "p2"
++    status: str = "open"
++    project: str | None = None
++    area: str | None = None
++    due_date: str | None = None
++    energy: str | None = None
++    effort_minutes: int | None = None
++    context: str | None = None
++    tags: tuple[str, ...] = ()
++    note: str | None = None
++    confidence: str = "medium"
++    raw_text: str = ""
++
++
++def split_work_message(raw_text: str) -> list[str]:
++    """Split a Discord work message into task-like lines.
++
++    Empty lines are ignored. Common checkbox and bullet prefixes are stripped, so a
++    multiline capture can become multiple work items.
++    """
++    lines: list[str] = []
++    for raw_line in raw_text.splitlines():
++        line = raw_line.strip()
++        if not line:
++            continue
++        line = re.sub(r"^[-*•]\s+", "", line)
++        line = re.sub(r"^\[(?: |x|X)\]\s+", "", line)
++        if line:
++            lines.append(line)
++    return lines or ([raw_text.strip()] if raw_text.strip() else [])
++
++
++def should_capture_work_message(raw_text: str) -> bool:
++    text = raw_text.strip()
++    if not text or text.startswith("!"):
++        return False
++    lowered = text.lower()
++    if lowered.startswith(("note:", "journal:", "log:")):
++        return False
++    return True
++
++
++def parse_work_item(raw_text: str, today: date | None = None) -> WorkItemDraft:
++    today = today or date.today()
++    original = raw_text.strip()
++    text = original
++    lowered = text.lower()
++
++    status = _parse_status(lowered)
++    due_date = _parse_due_date(lowered, today)
++    priority = _parse_priority(lowered, due_date, today, status)
++    project = _parse_project(text)
++    area = _parse_named_token(text, "area")
++    energy = _parse_energy(lowered)
++    effort_minutes = _parse_effort_minutes(lowered)
++    context = _parse_context(text)
++    tags = tuple(dict.fromkeys(tag.lower() for tag in re.findall(r"(?<!\w)#([A-Za-z][\w-]*)", text)))
++
++    title = _clean_title(text)
++    if not title:
++        title = original
++    confidence = "high" if _has_explicit_signal(lowered) else "medium"
++    return WorkItemDraft(
++        title=title,
++        priority=priority,
++        status=status,
++        project=project,
++        area=area,
++        due_date=due_date,
++        energy=energy,
++        effort_minutes=effort_minutes,
++        context=context,
++        tags=tags,
++        confidence=confidence,
++        raw_text=original,
++    )
++
++
++def normalize_priority(value: str | None) -> str:
++    if not value:
++        return "p2"
++    token = value.strip().lower()
++    token = token.replace("priority", "").replace(":", "").strip()
++    if token in PRIORITIES:
++        return token
++    if token in {"0", "urgent", "critical", "now", "must"}:
++        return "p0"
++    if token in {"1", "high", "important", "next"}:
++        return "p1"
++    if token in {"2", "normal", "medium"}:
++        return "p2"
++    if token in {"3", "low", "backlog", "someday"}:
++        return "p3"
++    return "p2"
++
++
++def priority_rank(priority: str) -> int:
++    try:
++        return PRIORITIES.index(priority)
++    except ValueError:
++        return PRIORITIES.index("p2")
++
++
++def render_item_line(item: dict[str, Any]) -> str:
++    parts = [f"`{item['id']}`", item.get("priority", "p2").upper(), item.get("title", "")]
++    due = item.get("due_date")
++    if due:
++        parts.append(f"due {due}")
++    project = item.get("project")
++    if project:
++        parts.append(f"project:{project}")
++    status = item.get("status")
++    if status and status != "open":
++        parts.append(f"status:{status}")
++    return " — ".join(str(part) for part in parts if part)
++
++
++def render_items(title: str, items: list[dict[str, Any]]) -> str:
++    if not items:
++        return f"**{title}**\nNo matching work items."
++    lines = [f"**{title}**"]
++    lines.extend(f"- {render_item_line(item)}" for item in items)
++    return "\n".join(lines)
++
++
++def render_focus_plan(local_date: str, focus: list[dict[str, Any]], blocked: list[dict[str, Any]]) -> str:
++    lines = [f"**Work focus for {local_date}**"]
++    if focus:
++        lines.append("Pick one, finish it, then pick the next:")
++        for index, item in enumerate(focus, start=1):
++            lines.append(f"{index}. {render_item_line(item)}")
++    else:
++        lines.append("No open focus items. Add one with `!work add <task>`." )
++    if blocked:
++        lines.append("")
++        lines.append("Blocked / waiting:")
++        for item in blocked[:5]:
++            lines.append(f"- {render_item_line(item)}")
++    lines.append("")
++    lines.append("Rule: start with the first P0/P1 item that can be completed in one work block.")
++    return "\n".join(lines)
++
++
++def render_search_results(query: str, results: list[dict[str, Any]]) -> str:
++    if not results:
++        return f"No local Life OS context found for `{query}`."
++    lines = [f"**Local context for `{query}`**"]
++    for result in results:
++        lines.append(f"- `{result['path']}:{result['line']}` — {result['snippet']}")
++    return "\n".join(lines)
++
++
++def _parse_status(lowered: str) -> str:
++    if lowered.startswith(("blocked", "blocker")) or " blocked by " in lowered:
++        return "blocked"
++    if lowered.startswith(("waiting", "wait for", "follow up")) or " waiting for " in lowered:
++        return "waiting"
++    return "open"
++
++
++def _parse_priority(lowered: str, due_date: str | None, today: date, status: str) -> str:
++    explicit = re.search(r"\bpriority[:=]?\s*p?([0-3])\b|\bp([0-3])\b", lowered)
++    if explicit:
++        value = explicit.group(1) or explicit.group(2)
++        return f"p{value}"
++    if any(token in lowered for token in ("urgent", "asap", "right now", "must", "critical", "blocker")):
++        return "p0"
++    if any(token in lowered for token in ("important", "high priority", "next action", "mit")):
++        return "p1"
++    if any(token in lowered for token in ("someday", "backlog", "low priority", "nice to have")):
++        return "p3"
++    if status == "blocked":
++        return "p1"
++    if due_date:
++        due = date.fromisoformat(due_date)
++        if due <= today:
++            return "p0"
++        if due <= today + timedelta(days=1):
++            return "p1"
++    return "p2"
++
++
++def _parse_due_date(lowered: str, today: date) -> str | None:
++    iso = re.search(r"\b(?:due|by|deadline)[:\s]+(20\d{2}-\d{2}-\d{2})\b", lowered)
++    if iso:
++        return iso.group(1)
++    if re.search(r"\b(?:today|eod|end of day)\b", lowered):
++        return today.isoformat()
++    if re.search(r"\btomorrow\b", lowered):
++        return (today + timedelta(days=1)).isoformat()
++    in_days = re.search(r"\bin\s+(\d{1,2})\s+days?\b", lowered)
++    if in_days:
++        return (today + timedelta(days=int(in_days.group(1)))).isoformat()
++    weekday = re.search(r"\b(?:by|due|next)?\s*(mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", lowered)
++    if weekday:
++        key = weekday.group(1)
++        target = WEEKDAYS.get(key)
++        if target is not None:
++            delta = (target - today.weekday()) % 7
++            if delta == 0 and "next" in lowered:
++                delta = 7
++            return (today + timedelta(days=delta)).isoformat()
++    return None
++
++
++def _parse_project(text: str) -> str | None:
++    bracket = re.search(r"^\[([^\]]{1,60})\]", text.strip())
++    if bracket:
++        return bracket.group(1).strip()
++    named = _parse_named_token(text, "project")
++    return named
++
++
++def _parse_named_token(text: str, key: str) -> str | None:
++    match = re.search(rf"\b{re.escape(key)}[:=]([^#@|;]+)", text, flags=re.IGNORECASE)
++    if not match:
++        return None
++    value = match.group(1).strip()
++    value = re.split(r"\s{2,}|\sdue:|\spriority:|\sarea:|\sproject:", value, maxsplit=1, flags=re.IGNORECASE)[0]
++    return value.strip() or None
++
++
++def _parse_context(text: str) -> str | None:
++    match = re.search(r"(?<!\w)@([A-Za-z][\w-]*)", text)
++    return match.group(1).lower() if match else None
++
++
++def _parse_energy(lowered: str) -> str | None:
++    explicit = re.search(r"\benergy[:=]\s*(low|medium|med|high)\b", lowered)
++    if explicit:
++        value = explicit.group(1)
++        return "medium" if value == "med" else value
++    if "low energy" in lowered:
++        return "low"
++    if "high energy" in lowered or "deep work" in lowered:
++        return "high"
++    return None
++
++
++def _parse_effort_minutes(lowered: str) -> int | None:
++    explicit = re.search(r"\beffort[:=]\s*(\d{1,3})\s*(m|min|mins|minutes|h|hr|hrs|hours)?\b", lowered)
++    if explicit:
++        amount = int(explicit.group(1))
++        unit = explicit.group(2) or "m"
++        return amount * 60 if unit.startswith("h") else amount
++    match = re.search(r"\b(\d{1,3})\s*(m|min|mins|minutes|h|hr|hrs|hours)\b", lowered)
++    if not match:
++        return None
++    amount = int(match.group(1))
++    unit = match.group(2)
++    return amount * 60 if unit.startswith("h") else amount
++
++
++def _clean_title(text: str) -> str:
++    title = text.strip()
++    title = re.sub(r"^\[([^\]]{1,60})\]\s*", "", title)
++    title = re.sub(r"^(todo|task|work|next|mit|blocked|blocker|waiting|follow up)[:\s-]+", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\bpriority[:=]?\s*p?[0-3]\b|\bp[0-3]\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\b(?:due|by|deadline)[:\s]+20\d{2}-\d{2}-\d{2}\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\b(?:due|by|deadline)[:\s]+(?:today|tomorrow|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\b(?:today|tomorrow|eod|end of day)\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\beffort[:=]\s*\d{1,3}\s*(?:m|min|mins|minutes|h|hr|hrs|hours)?\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\b\d{1,3}\s*(?:m|min|mins|minutes|h|hr|hrs|hours)\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\benergy[:=]\s*(?:low|medium|med|high)\b", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"\b(?:project|area)[:=][^#@|;]+", "", title, flags=re.IGNORECASE)
++    title = re.sub(r"(?<!\w)[#@][A-Za-z][\w-]*", "", title)
++    title = re.sub(r"\s+", " ", title)
++    return title.strip(" -:;|")
++
++
++def _has_explicit_signal(lowered: str) -> bool:
++    return any(
++        signal in lowered
++        for signal in ("todo", "task", "due", "priority", "p0", "p1", "p2", "p3", "urgent", "blocked")
++    )
+diff --git a/apps/discord_tracker/work_store.py b/apps/discord_tracker/work_store.py
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/apps/discord_tracker/work_store.py
+@@ -0,0 +1,600 @@
++from __future__ import annotations
++
++import json
++import sqlite3
++from datetime import date, datetime, timedelta, timezone
++from pathlib import Path
++from typing import Any
++
++from work import WorkItemDraft, priority_rank, render_focus_plan
++
++
++OPEN_STATUSES = ("open", "waiting", "blocked")
++
++
++class WorkStore:
++    """Work assistant storage integrated with the existing Life OS tracker DB.
++
++    This deliberately uses the same SQLite database and filesystem convention as
++    prayer/hydration/finance, but keeps work tables isolated so it can be added
++    without rewriting the existing TrackerStore.
++    """
++
++    def __init__(self, db_path: Path, lifeos_root: Path):
++        self.db_path = Path(db_path)
++        self.lifeos_root = Path(lifeos_root)
++        self.work_dir = self.lifeos_root / "data" / "work"
++        self.raw_capture_dir = self.lifeos_root / "raw" / "captures"
++        self.state_dir = self.lifeos_root / "state"
++        self.report_dir = self.lifeos_root / "reports" / "work"
++
++    async def init(self) -> None:
++        self.db_path.parent.mkdir(parents=True, exist_ok=True)
++        self.work_dir.mkdir(parents=True, exist_ok=True)
++        self.raw_capture_dir.mkdir(parents=True, exist_ok=True)
++        self.state_dir.mkdir(parents=True, exist_ok=True)
++        self.report_dir.mkdir(parents=True, exist_ok=True)
++        with self._connect() as db:
++            db.executescript(
++                """
++                CREATE TABLE IF NOT EXISTS work_items (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    title TEXT NOT NULL,
++                    status TEXT NOT NULL,
++                    priority TEXT NOT NULL,
++                    project TEXT,
++                    area TEXT,
++                    due_date TEXT,
++                    energy TEXT,
++                    effort_minutes INTEGER,
++                    context TEXT,
++                    tags_json TEXT NOT NULL,
++                    note TEXT,
++                    confidence TEXT NOT NULL,
++                    source TEXT NOT NULL,
++                    source_message_id INTEGER,
++                    source_channel_id INTEGER,
++                    logged_by INTEGER,
++                    raw_text TEXT NOT NULL,
++                    source_item_index INTEGER NOT NULL DEFAULT 0,
++                    created_at_utc TEXT NOT NULL,
++                    updated_at_utc TEXT NOT NULL,
++                    completed_at_utc TEXT,
++                    UNIQUE(source, source_message_id, source_item_index)
++                );
++
++                CREATE TABLE IF NOT EXISTS work_events (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    item_id INTEGER,
++                    event TEXT NOT NULL,
++                    payload_json TEXT NOT NULL,
++                    local_date TEXT NOT NULL,
++                    created_at_utc TEXT NOT NULL
++                );
++
++                CREATE TABLE IF NOT EXISTS work_improvements (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    idea TEXT NOT NULL,
++                    status TEXT NOT NULL,
++                    impact TEXT,
++                    effort TEXT,
++                    source TEXT NOT NULL,
++                    source_message_id INTEGER,
++                    source_channel_id INTEGER,
++                    logged_by INTEGER,
++                    created_at_utc TEXT NOT NULL,
++                    updated_at_utc TEXT NOT NULL
++                );
++                """
++            )
++            db.commit()
++        await self.write_state_snapshot()
++
++    def _connect(self) -> sqlite3.Connection:
++        con = sqlite3.connect(self.db_path)
++        con.row_factory = sqlite3.Row
++        return con
++
++    async def log_work_message(
++        self,
++        *,
++        local_date: str,
++        raw_text: str,
++        drafts: list[WorkItemDraft],
++        message_id: int | None,
++        channel_id: int | None,
++        channel_name: str,
++        logged_by: int | None,
++        source: str = "discord",
++    ) -> dict[str, Any]:
++        if not drafts:
++            return {"status": "ignored", "created": False, "item_ids": []}
++        with self._connect() as db:
++            duplicate = _work_duplicate(db, source, message_id)
++            if duplicate:
++                return {"status": "duplicate", "created": False, "item_ids": duplicate}
++
++            now = utc_now_iso()
++            item_ids: list[int] = []
++            records: list[dict[str, Any]] = []
++            for index, draft in enumerate(drafts):
++                item_id = _insert_work_item(
++                    db,
++                    draft=draft,
++                    raw_text=raw_text,
++                    source=source,
++                    message_id=message_id,
++                    source_item_index=index,
++                    channel_id=channel_id,
++                    logged_by=logged_by,
++                    now=now,
++                )
++                item_ids.append(item_id)
++                record = _work_record(
++                    item_id=item_id,
++                    draft=draft,
++                    raw_text=raw_text,
++                    source=source,
++                    message_id=message_id,
++                    source_item_index=index,
++                    channel_id=channel_id,
++                    logged_by=logged_by,
++                    event="work_item_created",
++                    now=now,
++                )
++                _insert_work_event(db, item_id, "created", record, local_date, now)
++                records.append(record)
++            db.commit()
++
++        for record in records:
++            await self._append_daily_logs(local_date, record, _work_md_row(record))
++        self._append_raw_work_capture(local_date, utc_now_iso(), source, channel_name, message_id, raw_text)
++        await self.write_state_snapshot()
++        return {"status": "created", "created": True, "item_ids": item_ids}
++
++    async def list_items(self, status: str = "open", limit: int = 12) -> list[dict[str, Any]]:
++        if status == "active":
++            where = "status IN ('open', 'waiting', 'blocked')"
++            params: tuple[Any, ...] = ()
++        else:
++            where = "status = ?"
++            params = (status,)
++        with self._connect() as db:
++            rows = db.execute(
++                f"""
++                SELECT * FROM work_items
++                WHERE {where}
++                ORDER BY
++                    CASE status WHEN 'blocked' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
++                    CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
++                    CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
++                    due_date ASC,
++                    created_at_utc ASC
++                LIMIT ?
++                """,
++                (*params, limit),
++            ).fetchall()
++        return [_row_to_item(row) for row in rows]
++
++    async def focus_items(self, local_date: str, limit: int = 5) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
++        today = date.fromisoformat(local_date)
++        soon = (today + timedelta(days=2)).isoformat()
++        with self._connect() as db:
++            focus_rows = db.execute(
++                """
++                SELECT * FROM work_items
++                WHERE status = 'open'
++                  AND (priority IN ('p0', 'p1') OR due_date <= ?)
++                ORDER BY
++                    CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
++                    CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
++                    due_date ASC,
++                    COALESCE(effort_minutes, 999) ASC,
++                    created_at_utc ASC
++                LIMIT ?
++                """,
++                (soon, limit),
++            ).fetchall()
++            blocked_rows = db.execute(
++                """
++                SELECT * FROM work_items
++                WHERE status IN ('blocked', 'waiting')
++                ORDER BY updated_at_utc DESC
++                LIMIT 5
++                """
++            ).fetchall()
++        focus = [_row_to_item(row) for row in focus_rows]
++        if len(focus) < limit:
++            more = await self.list_items("open", limit=limit * 2)
++            seen = {item["id"] for item in focus}
++            for item in more:
++                if item["id"] not in seen:
++                    focus.append(item)
++                    seen.add(item["id"])
++                if len(focus) >= limit:
++                    break
++        return focus, [_row_to_item(row) for row in blocked_rows]
++
++    async def build_focus_text(self, local_date: str, limit: int = 5) -> str:
++        focus, blocked = await self.focus_items(local_date, limit)
++        return render_focus_plan(local_date, focus, blocked)
++
++    async def set_item_status(
++        self,
++        item_id: int,
++        status: str,
++        *,
++        local_date: str,
++        note: str = "",
++        logged_by: int | None = None,
++    ) -> dict[str, Any] | None:
++        if status not in {"open", "waiting", "blocked", "done", "cancelled"}:
++            raise ValueError(f"Unsupported work status: {status}")
++        now = utc_now_iso()
++        completed_at = now if status == "done" else None
++        with self._connect() as db:
++            row = db.execute("SELECT * FROM work_items WHERE id = ?", (item_id,)).fetchone()
++            if row is None:
++                return None
++            db.execute(
++                """
++                UPDATE work_items
++                SET status = ?, note = ?, updated_at_utc = ?, completed_at_utc = COALESCE(?, completed_at_utc)
++                WHERE id = ?
++                """,
++                (status, note or row["note"], now, completed_at, item_id),
++            )
++            updated = db.execute("SELECT * FROM work_items WHERE id = ?", (item_id,)).fetchone()
++            item = _row_to_item(updated)
++            payload = {"event": f"work_item_{status}", "id": item_id, "status": status, "note": note, "logged_by": logged_by, **item}
++            _insert_work_event(db, item_id, status, payload, local_date, now)
++            db.commit()
++        await self._append_daily_logs(local_date, payload, _work_md_row(payload))
++        await self.write_state_snapshot()
++        return item
++
++    async def add_improvement(
++        self,
++        *,
++        idea: str,
++        local_date: str,
++        source: str,
++        message_id: int | None,
++        channel_id: int | None,
++        logged_by: int | None,
++    ) -> int:
++        now = utc_now_iso()
++        with self._connect() as db:
++            cur = db.execute(
++                """
++                INSERT INTO work_improvements
++                    (idea, status, impact, effort, source, source_message_id, source_channel_id,
++                     logged_by, created_at_utc, updated_at_utc)
++                VALUES (?, 'open', NULL, NULL, ?, ?, ?, ?, ?, ?)
++                """,
++                (idea.strip(), source, message_id, channel_id, logged_by, now, now),
++            )
++            improvement_id = int(cur.lastrowid)
++            payload = {"event": "work_improvement", "id": improvement_id, "idea": idea.strip(), "status": "open"}
++            _insert_work_event(db, None, "improvement", payload, local_date, now)
++            db.commit()
++        await self._append_daily_logs(local_date, payload, _work_md_row(payload))
++        return improvement_id
++
++    async def daily_review(self, local_date: str) -> str:
++        today = date.fromisoformat(local_date)
++        with self._connect() as db:
++            completed = db.execute(
++                "SELECT COUNT(*) FROM work_items WHERE date(completed_at_utc) = ?",
++                (local_date,),
++            ).fetchone()[0]
++            open_count = db.execute(
++                "SELECT COUNT(*) FROM work_items WHERE status = 'open'",
++            ).fetchone()[0]
++            blocked_count = db.execute(
++                "SELECT COUNT(*) FROM work_items WHERE status IN ('blocked', 'waiting')",
++            ).fetchone()[0]
++            overdue = db.execute(
++                "SELECT COUNT(*) FROM work_items WHERE status = 'open' AND due_date < ?",
++                (today.isoformat(),),
++            ).fetchone()[0]
++        focus, blocked = await self.focus_items(local_date, 5)
++        report = [
++            f"# Work Review - {local_date}",
++            "",
++            "## Metrics",
++            f"- Completed today: {completed}",
++            f"- Open items: {open_count}",
++            f"- Blocked/waiting: {blocked_count}",
++            f"- Overdue: {overdue}",
++            "",
++            "## Tomorrow / Next Focus",
++        ]
++        if focus:
++            for item in focus:
++                report.append(f"- {item['priority'].upper()} #{item['id']} {item['title']}")
++        else:
++            report.append("- No open focus items.")
++        if blocked:
++            report.extend(["", "## Blocked / Waiting"])
++            for item in blocked:
++                report.append(f"- #{item['id']} {item['title']} ({item['status']})")
++        report.extend([
++            "",
++            "## Continuous Improvement Prompt",
++            "- What wasted the most time today?",
++            "- What should be automated, templated, delegated, or clarified before tomorrow?",
++            "",
++        ])
++        output = self.report_dir / f"{local_date}.md"
++        output.parent.mkdir(parents=True, exist_ok=True)
++        output.write_text("\n".join(report), encoding="utf-8")
++        return str(output.relative_to(self.lifeos_root))
++
++    async def search_context(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
++        tokens = [token.lower() for token in query.split() if len(token) >= 2]
++        if not tokens:
++            return []
++        roots = [
++            self.lifeos_root / "wiki",
++            self.lifeos_root / "state",
++            self.lifeos_root / "reports",
++            self.lifeos_root / "memory" / "curated",
++            self.lifeos_root / "data" / "daily-summary",
++            self.lifeos_root / "data" / "work",
++        ]
++        results: list[dict[str, Any]] = []
++        for root in roots:
++            if not root.exists():
++                continue
++            for path in root.rglob("*.md"):
++                if path.stat().st_size > 200_000:
++                    continue
++                try:
++                    lines = path.read_text(encoding="utf-8").splitlines()
++                except UnicodeDecodeError:
++                    continue
++                for line_no, line in enumerate(lines, start=1):
++                    lower = line.lower()
++                    score = sum(1 for token in tokens if token in lower)
++                    if score == 0:
++                        continue
++                    rel = str(path.relative_to(self.lifeos_root))
++                    snippet = line.strip()
++                    if len(snippet) > 180:
++                        snippet = snippet[:177] + "..."
++                    results.append({"path": rel, "line": line_no, "snippet": snippet, "score": score})
++        results.sort(key=lambda item: (-item["score"], item["path"], item["line"]))
++        return results[:limit]
++
++    async def write_state_snapshot(self) -> None:
++        if not self.db_path.exists():
++            return
++        active = await self.list_items("active", limit=50)
++        now_items = [item for item in active if item["status"] == "open" and item["priority"] in {"p0", "p1"}]
++        next_items = [item for item in active if item["status"] == "open" and item["priority"] not in {"p0", "p1"}]
++        blocked = [item for item in active if item["status"] in {"blocked", "waiting"}]
++
++        lines = [
++            "# Work State",
++            "",
++            f"Generated: {utc_now_iso()}",
++            "Source: tracker DB work_items + data/work daily logs",
++            "",
++            "## Now",
++        ]
++        lines.extend(_state_lines(now_items[:10]))
++        lines.extend(["", "## Next"])
++        lines.extend(_state_lines(next_items[:20]))
++        lines.extend(["", "## Blocked / Waiting"])
++        lines.extend(_state_lines(blocked[:20]))
++        lines.extend([
++            "",
++            "## Operating Rules",
++            "- Prefer one P0/P1 item in progress at a time.",
++            "- Blocked items need a named next unblock action.",
++            "- Capture recurring friction with `!work improve <idea>`.",
++            "",
++        ])
++        (self.state_dir / "work.md").write_text("\n".join(lines), encoding="utf-8")
++
++    async def _append_daily_logs(self, local_date: str, record: dict[str, Any], markdown_row: str) -> None:
++        jsonl_path = self.work_dir / f"{local_date}.jsonl"
++        md_path = self.work_dir / f"{local_date}.md"
++        _append_text(jsonl_path, json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
++        if not md_path.exists():
++            _append_text(md_path, _md_header(local_date))
++        _append_text(md_path, markdown_row)
++
++    def _append_raw_work_capture(
++        self,
++        local_date: str,
++        timestamp_utc: str,
++        source: str,
++        channel_name: str,
++        message_id: int | None,
++        raw_text: str,
++    ) -> None:
++        capture_id = f"work-{source}-{message_id or timestamp_utc.replace(':', '').replace('+', '')}"
++        block = (
++            "\n---\n\n"
++            f"capture_id: {capture_id}\n"
++            f"timestamp: {timestamp_utc}\n"
++            f"source: {source}:#{channel_name}\n"
++            "classification: task\n"
++            "status: work_structured\n"
++            "processed: true\n\n"
++            f"{raw_text}\n"
++        )
++        _append_text(self.raw_capture_dir / f"{local_date}.md", block)
++
++
++def utc_now_iso() -> str:
++    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
++
++
++def _insert_work_item(
++    db: sqlite3.Connection,
++    *,
++    draft: WorkItemDraft,
++    raw_text: str,
++    source: str,
++    message_id: int | None,
++    source_item_index: int,
++    channel_id: int | None,
++    logged_by: int | None,
++    now: str,
++) -> int:
++    cur = db.execute(
++        """
++        INSERT INTO work_items
++            (title, status, priority, project, area, due_date, energy, effort_minutes,
++             context, tags_json, note, confidence, source, source_message_id,
++             source_channel_id, logged_by, raw_text, source_item_index, created_at_utc,
++             updated_at_utc)
++        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++        """,
++        (
++            draft.title,
++            draft.status,
++            draft.priority,
++            draft.project,
++            draft.area,
++            draft.due_date,
++            draft.energy,
++            draft.effort_minutes,
++            draft.context,
++            json.dumps(list(draft.tags), sort_keys=True),
++            draft.note,
++            draft.confidence,
++            source,
++            message_id,
++            channel_id,
++            logged_by,
++            raw_text,
++            source_item_index,
++            now,
++            now,
++        ),
++    )
++    return int(cur.lastrowid)
++
++
++def _insert_work_event(db: sqlite3.Connection, item_id: int | None, event: str, payload: dict[str, Any], local_date: str, now: str) -> None:
++    db.execute(
++        """
++        INSERT INTO work_events (item_id, event, payload_json, local_date, created_at_utc)
++        VALUES (?, ?, ?, ?, ?)
++        """,
++        (item_id, event, json.dumps(payload, sort_keys=True, ensure_ascii=False), local_date, now),
++    )
++
++
++def _work_duplicate(db: sqlite3.Connection, source: str, message_id: int | None) -> list[int] | None:
++    if message_id is None:
++        return None
++    rows = db.execute(
++        """
++        SELECT id FROM work_items
++        WHERE source = ? AND source_message_id = ?
++        ORDER BY source_item_index, id
++        """,
++        (source, message_id),
++    ).fetchall()
++    if not rows:
++        return None
++    return [int(row[0]) for row in rows]
++
++
++def _work_record(
++    *,
++    item_id: int,
++    draft: WorkItemDraft,
++    raw_text: str,
++    source: str,
++    message_id: int | None,
++    source_item_index: int,
++    channel_id: int | None,
++    logged_by: int | None,
++    event: str,
++    now: str,
++) -> dict[str, Any]:
++    return {
++        "event": event,
++        "id": item_id,
++        "title": draft.title,
++        "status": draft.status,
++        "priority": draft.priority,
++        "project": draft.project,
++        "area": draft.area,
++        "due_date": draft.due_date,
++        "energy": draft.energy,
++        "effort_minutes": draft.effort_minutes,
++        "context": draft.context,
++        "tags": list(draft.tags),
++        "note": draft.note,
++        "confidence": draft.confidence,
++        "raw_text": raw_text,
++        "source": source,
++        "source_message_id": message_id,
++        "source_item_index": source_item_index,
++        "source_channel_id": channel_id,
++        "logged_by": logged_by,
++        "created_at_utc": now,
++        "updated_at_utc": now,
++    }
++
++
++def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
++    item = dict(row)
++    try:
++        item["tags"] = json.loads(item.pop("tags_json") or "[]")
++    except json.JSONDecodeError:
++        item["tags"] = []
++    return item
++
++
++def _work_md_row(record: dict[str, Any]) -> str:
++    event = record.get("event", "work_event")
++    timestamp = record.get("updated_at_utc") or record.get("created_at_utc") or utc_now_iso()
++    title = str(record.get("title") or record.get("idea") or record.get("note") or "").replace("|", "\\|")
++    item_id = record.get("id", "")
++    priority = record.get("priority", "")
++    status = record.get("status", "")
++    project = (record.get("project") or "").replace("|", "\\|")
++    due = record.get("due_date") or ""
++    return f"| {timestamp} | {event} | {item_id} | {priority} | {status} | {title} | {project} | {due} |\n"
++
++
++def _md_header(local_date: str) -> str:
++    return (
++        f"# Work Log {local_date}\n\n"
++        "| Time (UTC) | Event | ID | Priority | Status | Title | Project | Due |\n"
++        "|---|---|---:|---|---|---|---|---|\n"
++    )
++
++
++def _state_lines(items: list[dict[str, Any]]) -> list[str]:
++    if not items:
++        return ["- none"]
++    ordered = sorted(
++        items,
++        key=lambda item: (
++            priority_rank(item.get("priority", "p2")),
++            item.get("due_date") or "9999-99-99",
++            item.get("created_at_utc") or "",
++        ),
++    )
++    lines = []
++    for item in ordered:
++        due = f" due {item['due_date']}" if item.get("due_date") else ""
++        project = f" project:{item['project']}" if item.get("project") else ""
++        status = f" status:{item['status']}" if item.get("status") != "open" else ""
++        lines.append(f"- #{item['id']} [{item.get('priority', 'p2').upper()}]{due}{project}{status} — {item['title']}")
++    return lines
++
++
++def _append_text(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("a", encoding="utf-8") as handle:
++        handle.write(text)
+diff --git a/apps/discord_tracker/tests/test_work_assistant.py b/apps/discord_tracker/tests/test_work_assistant.py
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/apps/discord_tracker/tests/test_work_assistant.py
+@@ -0,0 +1,110 @@
++from __future__ import annotations
++
++import asyncio
++import tempfile
++import unittest
++from datetime import date
++from pathlib import Path
++
++import sys
++
++APP_DIR = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(APP_DIR))
++
++from work import parse_work_item, split_work_message
++from work_store import WorkStore
++
++
++class WorkParserTests(unittest.TestCase):
++    def test_parse_explicit_priority_due_project(self) -> None:
++        item = parse_work_item(
++            "todo: send client invoice priority:p1 due:2026-05-04 project:Acme @email #billing 20m",
++            today=date(2026, 5, 2),
++        )
++        self.assertEqual(item.title, "send client invoice")
++        self.assertEqual(item.priority, "p1")
++        self.assertEqual(item.due_date, "2026-05-04")
++        self.assertEqual(item.project, "Acme")
++        self.assertEqual(item.context, "email")
++        self.assertEqual(item.tags, ("billing",))
++        self.assertEqual(item.effort_minutes, 20)
++
++    def test_parse_urgent_today_as_p0(self) -> None:
++        item = parse_work_item("urgent fix production bug today project:Hermes", today=date(2026, 5, 2))
++        self.assertEqual(item.priority, "p0")
++        self.assertEqual(item.due_date, "2026-05-02")
++        self.assertEqual(item.project, "Hermes")
++
++    def test_multiline_split(self) -> None:
++        self.assertEqual(split_work_message("- task one\n- task two"), ["task one", "task two"])
++
++
++class WorkStoreTests(unittest.TestCase):
++    def test_create_done_and_state_snapshot(self) -> None:
++        async def run_case() -> None:
++            with tempfile.TemporaryDirectory() as tempdir:
++                root = Path(tempdir)
++                store = WorkStore(root / "tracker.db", root)
++                await store.init()
++                drafts = [parse_work_item("todo: send update due:2026-05-02 p1", today=date(2026, 5, 2))]
++                result = await store.log_work_message(
++                    local_date="2026-05-02",
++                    raw_text="todo: send update due:2026-05-02 p1",
++                    drafts=drafts,
++                    message_id=10,
++                    channel_id=20,
++                    channel_name="work-tracker",
++                    logged_by=30,
++                )
++                self.assertTrue(result["created"])
++                duplicate = await store.log_work_message(
++                    local_date="2026-05-02",
++                    raw_text="todo: send update due:2026-05-02 p1",
++                    drafts=drafts,
++                    message_id=10,
++                    channel_id=20,
++                    channel_name="work-tracker",
++                    logged_by=30,
++                )
++                self.assertFalse(duplicate["created"])
++                active = await store.list_items("active")
++                self.assertEqual(len(active), 1)
++                self.assertEqual(active[0]["priority"], "p1")
++                done = await store.set_item_status(active[0]["id"], "done", local_date="2026-05-02")
++                self.assertIsNotNone(done)
++                self.assertEqual(done["status"], "done")
++                self.assertTrue((root / "data" / "work" / "2026-05-02.jsonl").exists())
++                state = (root / "state" / "work.md").read_text(encoding="utf-8")
++                self.assertIn("# Work State", state)
++
++        asyncio.run(run_case())
++
++    def test_focus_and_search_context(self) -> None:
++        async def run_case() -> None:
++            with tempfile.TemporaryDirectory() as tempdir:
++                root = Path(tempdir)
++                (root / "wiki" / "domains").mkdir(parents=True)
++                (root / "wiki" / "domains" / "work.md").write_text("Important client onboarding checklist", encoding="utf-8")
++                store = WorkStore(root / "tracker.db", root)
++                await store.init()
++                drafts = [parse_work_item("urgent unblock client onboarding today", today=date(2026, 5, 2))]
++                await store.log_work_message(
++                    local_date="2026-05-02",
++                    raw_text=drafts[0].raw_text,
++                    drafts=drafts,
++                    message_id=None,
++                    channel_id=None,
++                    channel_name="work-tracker",
++                    logged_by=None,
++                )
++                focus_text = await store.build_focus_text("2026-05-02")
++                self.assertIn("Work focus", focus_text)
++                self.assertIn("P0", focus_text)
++                results = await store.search_context("client checklist")
++                self.assertEqual(results[0]["path"], "wiki/domains/work.md")
++
++        asyncio.run(run_case())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/summarize_work_day.py b/scripts/summarize_work_day.py
+new file mode 100755
+index 0000000..0000000
+--- /dev/null
++++ b/scripts/summarize_work_day.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import os
++import sqlite3
++from dataclasses import dataclass
++from datetime import date, timedelta
++from pathlib import Path
++
++
++@dataclass(frozen=True)
++class Config:
++    root: Path
++    db_path: Path
++
++
++def load_config() -> Config:
++    root = Path(os.environ.get("LIFEOS_ROOT", "/home/ubuntu/hermis-life-os")).expanduser()
++    db_path = Path(os.environ.get("TRACKER_DB", str(root / "data" / "lifeos_tracker.db"))).expanduser()
++    env_file = root / ".env.discord-tracker"
++    if env_file.exists():
++        for line in env_file.read_text(encoding="utf-8").splitlines():
++            stripped = line.strip()
++            if not stripped or stripped.startswith("#") or "=" not in stripped:
++                continue
++            key, value = stripped.split("=", 1)
++            if key.strip() == "TRACKER_DB":
++                db_path = Path(value.strip().strip('"')).expanduser()
++    return Config(root=root, db_path=db_path)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Write a daily work assistant review from tracker DB.")
++    parser.add_argument("day", nargs="?", default=date.today().isoformat(), help="Local date to summarize, default: today")
++    parser.add_argument("--output", default=None, help="Output markdown path, default: reports/work/YYYY-MM-DD.md")
++    return parser.parse_args()
++
++
++def table_exists(con: sqlite3.Connection, name: str) -> bool:
++    row = con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
++    return row is not None
++
++
++def fetch_day(con: sqlite3.Connection, day: str) -> dict:
++    empty = {
++        "completed": [],
++        "created": [],
++        "open_focus": [],
++        "blocked": [],
++        "improvements": [],
++        "counts": {"open": 0, "waiting": 0, "blocked": 0, "done_today": 0},
++    }
++    if not table_exists(con, "work_items"):
++        return empty
++    con.row_factory = sqlite3.Row
++    today = date.fromisoformat(day)
++    soon = (today + timedelta(days=2)).isoformat()
++    completed = con.execute(
++        """
++        SELECT id, title, priority, project, due_date
++        FROM work_items
++        WHERE completed_at_utc LIKE ?
++        ORDER BY completed_at_utc ASC
++        """,
++        (f"{day}%",),
++    ).fetchall()
++    created = con.execute(
++        """
++        SELECT id, title, priority, project, due_date
++        FROM work_items
++        WHERE created_at_utc LIKE ?
++        ORDER BY created_at_utc ASC
++        """,
++        (f"{day}%",),
++    ).fetchall()
++    focus = con.execute(
++        """
++        SELECT id, title, priority, project, due_date, effort_minutes
++        FROM work_items
++        WHERE status = 'open' AND (priority IN ('p0', 'p1') OR due_date <= ?)
++        ORDER BY CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END,
++                 CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
++                 due_date ASC,
++                 COALESCE(effort_minutes, 999) ASC
++        LIMIT 8
++        """,
++        (soon,),
++    ).fetchall()
++    blocked = con.execute(
++        """
++        SELECT id, title, status, priority, project, due_date
++        FROM work_items
++        WHERE status IN ('blocked', 'waiting')
++        ORDER BY updated_at_utc DESC
++        LIMIT 8
++        """
++    ).fetchall()
++    counts = {}
++    for status in ("open", "waiting", "blocked"):
++        counts[status] = con.execute("SELECT COUNT(*) FROM work_items WHERE status = ?", (status,)).fetchone()[0]
++    counts["done_today"] = len(completed)
++    improvements = []
++    if table_exists(con, "work_improvements"):
++        improvements = con.execute(
++            """
++            SELECT id, idea, status
++            FROM work_improvements
++            WHERE status = 'open'
++            ORDER BY created_at_utc DESC
++            LIMIT 8
++            """
++        ).fetchall()
++    return {
++        "completed": [dict(row) for row in completed],
++        "created": [dict(row) for row in created],
++        "open_focus": [dict(row) for row in focus],
++        "blocked": [dict(row) for row in blocked],
++        "improvements": [dict(row) for row in improvements],
++        "counts": counts,
++    }
++
++
++def item_line(row: dict) -> str:
++    due = f" due {row['due_date']}" if row.get("due_date") else ""
++    project = f" project:{row['project']}" if row.get("project") else ""
++    return f"- #{row['id']} [{row.get('priority', '').upper()}]{due}{project} — {row['title']}"
++
++
++def render(day: str, data: dict) -> str:
++    lines = [
++        f"# Work Review - {day}",
++        "",
++        "## Metrics",
++        f"- Completed today: {data['counts'].get('done_today', 0)}",
++        f"- Open: {data['counts'].get('open', 0)}",
++        f"- Waiting: {data['counts'].get('waiting', 0)}",
++        f"- Blocked: {data['counts'].get('blocked', 0)}",
++        "",
++        "## Completed Today",
++    ]
++    lines.extend(item_line(row) for row in data["completed"]) if data["completed"] else lines.append("- none")
++    lines.extend(["", "## Created Today"])
++    lines.extend(item_line(row) for row in data["created"]) if data["created"] else lines.append("- none")
++    lines.extend(["", "## Next Focus"])
++    lines.extend(item_line(row) for row in data["open_focus"]) if data["open_focus"] else lines.append("- none")
++    lines.extend(["", "## Blocked / Waiting"])
++    lines.extend(item_line(row) for row in data["blocked"]) if data["blocked"] else lines.append("- none")
++    lines.extend(["", "## Improvement Backlog"])
++    if data["improvements"]:
++        lines.extend(f"- improve:{row['id']} {row['idea']}" for row in data["improvements"])
++    else:
++        lines.append("- none")
++    lines.extend([
++        "",
++        "## End-of-Day Questions",
++        "- What should be clarified before the next work block?",
++        "- What repeated friction should become automation, a template, or a checklist?",
++        "",
++    ])
++    return "\n".join(lines)
++
++
++def main() -> int:
++    args = parse_args()
++    config = load_config()
++    day = date.fromisoformat(args.day).isoformat()
++    output = Path(args.output).expanduser() if args.output else config.root / "reports" / "work" / f"{day}.md"
++    if not config.db_path.exists():
++        raise SystemExit(f"tracker DB missing: {config.db_path}")
++    with sqlite3.connect(f"file:{config.db_path}?mode=ro", uri=True) as con:
++        data = fetch_day(con, day)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(render(day, data), encoding="utf-8")
++    print(f"wrote work review: {output}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/docs/WORK_ASSISTANT.md b/docs/WORK_ASSISTANT.md
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/docs/WORK_ASSISTANT.md
+@@ -0,0 +1,112 @@
++# Work Assistant
++
++The work assistant is an integrated Hermis Life OS module, not a separate app. It runs inside the existing Discord tracker sidecar, writes to the same tracker database, and mirrors useful state into the Life OS filesystem.
++
++## Goals
++
++- Track to-do items quickly from Discord.
++- Organize work by priority, due date, project, context, and blocked/waiting state.
++- Produce a short focus plan instead of a long task dump.
++- Retrieve local Life OS context when needed without searching raw/private logs by default.
++- Create a continuous improvement loop for repeated work friction.
++
++## Files
++
++- Bot integration: `apps/discord_tracker/bot.py`
++- Work parser: `apps/discord_tracker/work.py`
++- Work storage: `apps/discord_tracker/work_store.py`
++- Runtime database: `data/lifeos_tracker.db`
++- Work logs: `data/work/YYYY-MM-DD.jsonl` and `data/work/YYYY-MM-DD.md`
++- Current work snapshot: `state/work.md`
++- Work reviews: `reports/work/YYYY-MM-DD.md`
++- Daily review script: `scripts/summarize_work_day.py`
++
++## Setup
++
++Add these optional values to `.env.discord-tracker`:
++
++```dotenv
++WORK_CHANNEL_NAME=work-tracker
++WORK_MORNING_PLAN_HOUR=14
++WORK_SHUTDOWN_REVIEW_HOUR=23
++```
++
++Create a Discord channel named `#work-tracker`, or change `WORK_CHANNEL_NAME`.
++
++The bot needs the same Discord permissions already required by the tracker sidecar:
++
++- View Channels
++- Send Messages
++- Read Message History
++- Use Message Content Intent
++
++## Capture format
++
++Any non-command owner message in `#work-tracker` is captured as work. Multiline messages become multiple work items.
++
++Examples:
++
++```text
++todo: send client update priority:p1 due:2026-05-04 project:Acme @email #client 20m
++urgent fix deployment issue today project:Hermes @code
++blocked: waiting for invoice details project:Admin
++someday make a reusable onboarding checklist project:LifeOS
++```
++
++Parsed fields:
++
++- Priority: `p0`, `p1`, `p2`, `p3`, or words like `urgent`, `important`, `backlog`.
++- Due date: `due:YYYY-MM-DD`, `today`, `tomorrow`, weekday names, or `in N days`.
++- Project: `[Project]` prefix or `project:Name`.
++- Context: `@email`, `@code`, `@call`, etc.
++- Tags: `#client`, `#admin`, etc.
++- Effort: `20m`, `1h`, or `effort:45`.
++- Energy: `energy:low`, `energy:medium`, `energy:high`.
++
++## Commands
++
++- `!work` or `!work list` — show active work.
++- `!work add <task>` — add one task; multiline text creates multiple tasks.
++- `!work today` — show the focus plan for today.
++- `!work focus` — same as today; optimized for what to do next.
++- `!work done <id>` — mark an item done.
++- `!work block <id> <reason>` — mark an item blocked.
++- `!work wait <id> <reason>` — mark an item waiting.
++- `!work cancel <id> <reason>` — cancel an item.
++- `!work info <query>` — search compiled Life OS context in `wiki/`, `state/`, `reports/`, `memory/curated/`, `data/daily-summary/`, and `data/work/`.
++- `!work improve <idea>` — add an improvement candidate.
++- `!work review` — write `reports/work/YYYY-MM-DD.md`.
++
++## Automation
++
++The bot posts two daily prompts in `#work-tracker`, aligned with the user's Casablanca work window (14:00-23:00 by default):
++
++1. Workday start focus plan at `WORK_MORNING_PLAN_HOUR`.
++2. Workday shutdown review prompt at `WORK_SHUTDOWN_REVIEW_HOUR`.
++
++The prompts are idempotent because they use the existing `posted_reminders` table with `kind='work'`.
++
++For a deterministic end-of-day report, run:
++
++```bash
++scripts/summarize_work_day.py <YYYY-MM-DD>
++```
++
++## Memory and retrieval policy
++
++Work can contain sensitive company/client context. By default:
++
++- Raw work captures remain local in `raw/captures/`.
++- Detailed work events remain local in `data/work/` and SQLite.
++- Hermes/OpenViking should index `wiki/`, `state/work.md`, and user-approved curated work memories first.
++- The `!work info` command searches compiled/local Life OS text and intentionally skips raw captures, raw documents, tracker DB rows, env files, and backups.
++
++## Continuous improvement loop
++
++At the end of a workday, add friction or automation ideas with:
++
++```text
++!work improve Make invoice sending a checklist/template
++```
++
++Weekly review should inspect open improvement candidates and decide whether to automate, template, delegate, clarify, or delete each one.
+diff --git a/state/work.md b/state/work.md
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/state/work.md
+@@ -0,0 +1,18 @@
++# Work State
++
++Generated: manual bootstrap
++Source: tracker DB work_items + data/work daily logs
++
++## Now
++- none
++
++## Next
++- none
++
++## Blocked / Waiting
++- none
++
++## Operating Rules
++- Prefer one P0/P1 item in progress at a time.
++- Blocked items need a named next unblock action.
++- Capture recurring friction with `!work improve <idea>`.
+diff --git a/apps/discord_tracker/config.py b/apps/discord_tracker/config.py
+--- a/apps/discord_tracker/config.py
++++ b/apps/discord_tracker/config.py
+@@ -19,6 +19,7 @@ class TrackerConfig:
+     prayer_channel_name: str
+     hydration_channel_name: str
+     finance_channel_name: str
++    work_channel_name: str
+     lifeos_root: Path
+     tracker_db: Path
+     timezone: str
+@@ -33,3 +34,5 @@ class TrackerConfig:
+     hydration_end_hour: int
+     hydration_interval_minutes: int
+     hydration_target_count: int
++    work_morning_plan_hour: int
++    work_shutdown_review_hour: int
+@@ -85,6 +88,7 @@ def load_config() -> TrackerConfig:
+         prayer_channel_name=os.getenv("PRAYER_CHANNEL_NAME", "prayer-tracker"),
+         hydration_channel_name=os.getenv("HYDRATION_CHANNEL_NAME", "habits"),
+         finance_channel_name=os.getenv("FINANCE_CHANNEL_NAME", "finance-tracker"),
++        work_channel_name=os.getenv("WORK_CHANNEL_NAME", "work-tracker"),
+         lifeos_root=lifeos_root,
+         tracker_db=tracker_db,
+         timezone=os.getenv("TIMEZONE", "Africa/Casablanca"),
+@@ -98,4 +102,6 @@ def load_config() -> TrackerConfig:
+         hydration_end_hour=_int_env("HYDRATION_END_HOUR", 22),
+         hydration_interval_minutes=_int_env("HYDRATION_INTERVAL_MINUTES", 90),
+         hydration_target_count=_int_env("HYDRATION_TARGET_COUNT", 8),
++        work_morning_plan_hour=_int_env("WORK_MORNING_PLAN_HOUR", 14),
++        work_shutdown_review_hour=_int_env("WORK_SHUTDOWN_REVIEW_HOUR", 23),
+     )
+diff --git a/apps/discord_tracker/bot.py b/apps/discord_tracker/bot.py
+--- a/apps/discord_tracker/bot.py
++++ b/apps/discord_tracker/bot.py
+@@ -24,3 +24,11 @@ from prayer import (
+     prayer_embed_text,
+ )
+ from store import TrackerStore
++from work import (
++    parse_work_item,
++    render_items,
++    render_search_results,
++    should_capture_work_message,
++    split_work_message,
++)
++from work_store import WorkStore
+@@ -43,6 +50,7 @@ class DiscordTracker(commands.Bot):
+         super().__init__(command_prefix="!", intents=intents)
+         self.config = config
+         self.store = store
++        self.work_store = WorkStore(config.tracker_db, config.lifeos_root)
+         self.tz = ZoneInfo(config.timezone)
+         self.http_session: aiohttp.ClientSession | None = None
+         self.add_commands()
+@@ -50,12 +58,15 @@ class DiscordTracker(commands.Bot):
+     async def setup_hook(self) -> None:
+         await self.store.init()
++        await self.work_store.init()
+         self.http_session = aiohttp.ClientSession()
+         self.prayer_scheduler.start()
+         self.hydration_scheduler.start()
++        self.work_scheduler.start()
+ 
+     async def close(self) -> None:
+         self.prayer_scheduler.cancel()
+         self.hydration_scheduler.cancel()
++        self.work_scheduler.cancel()
+         if self.http_session:
+             await self.http_session.close()
+         await super().close()
+@@ -75,4 +86,5 @@ class DiscordTracker(commands.Bot):
+             await self.process_commands(message)
+             return
+         await self._maybe_capture_finance_message(message, content)
++        await self._maybe_capture_work_message(message, content)
+         await self.process_commands(message)
+@@ -194,4 +206,38 @@ class DiscordTracker(commands.Bot):
+         await message.channel.send(
+             f"Money needs review `{result['review_id']}`: {reason}. "
+             f"Use `!money edit review:{result['review_id']} <corrected text>`."
+         )
++
++    async def _maybe_capture_work_message(self, message: discord.Message, content: str) -> None:
++        if not content:
++            return
++        if not is_owner_id(message.author.id, self.config.discord_owner_ids):
++            return
++        channel_name = getattr(message.channel, "name", "")
++        if channel_name != self.config.work_channel_name:
++            return
++        if not should_capture_work_message(content):
++            return
++
++        today = datetime.now(self.tz).date()
++        local_date = today.isoformat()
++        drafts = [parse_work_item(line, today=today) for line in split_work_message(content)]
++        result = await self.work_store.log_work_message(
++            local_date=local_date,
++            raw_text=content,
++            drafts=drafts,
++            message_id=message.id,
++            channel_id=message.channel.id,
++            channel_name=channel_name,
++            logged_by=message.author.id,
++        )
++        if not result.get("created"):
++            return
++        item_ids = result.get("item_ids", [])
++        if len(item_ids) == 1:
++            draft = drafts[0]
++            due = f" due {draft.due_date}" if draft.due_date else ""
++            await message.channel.send(f"Captured work `{item_ids[0]}`: {draft.priority.upper()} {draft.title}{due}.")
++        else:
++            ids = ", ".join(f"`{item_id}`" for item_id in item_ids)
++            await message.channel.send(f"Captured {len(item_ids)} work items: {ids}.")
+@@ -244,8 +288,37 @@ class DiscordTracker(commands.Bot):
+         message = await self._send_embed_with_reactions(channel, title, description, footer, "hydration")
+         await self.store.save_posted_reminder(
+             "hydration",
+             local_date,
+             reminder_id,
+             message.id,
+             channel.id,
+         )
++
++    @tasks.loop(minutes=5)
++    async def work_scheduler(self) -> None:
++        await self.wait_until_ready()
++        now_local = datetime.now(self.tz)
++        local_date = now_local.date().isoformat()
++        channel = await self._named_channel(self.config.work_channel_name)
++        if channel is None:
++            return
++
++        if now_local.hour == self.config.work_morning_plan_hour and now_local.minute < 5:
++            reminder_id = f"{local_date}-morning-plan"
++            if await self.store.get_posted_reminder("work", local_date, reminder_id):
++                return
++            text = await self.work_store.build_focus_text(local_date)
++            message = await channel.send(text)
++            await self.store.save_posted_reminder("work", local_date, reminder_id, message.id, channel.id)
++            return
++
++        if now_local.hour == self.config.work_shutdown_review_hour and now_local.minute < 5:
++            reminder_id = f"{local_date}-shutdown-review"
++            if await self.store.get_posted_reminder("work", local_date, reminder_id):
++                return
++            path = await self.work_store.daily_review(local_date)
++            message = await channel.send(
++                "Work shutdown review written to "
++                f"`{path}`. Reply with `!work improve <friction>` for anything to improve."
++            )
++            await self.store.save_posted_reminder("work", local_date, reminder_id, message.id, channel.id)
+@@ -492,9 +567,118 @@ class DiscordTracker(commands.Bot):
+             if result is None:
+                 await ctx.send(f"No open money item `{item_id}` found.")
+                 return
+             await ctx.send(f"Voided money {result['kind']} `{result['id']}`.")
++
++        @self.group(name="work", invoke_without_command=True)
++        async def work_cmd(ctx: commands.Context) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            items = await self.work_store.list_items("active")
++            await ctx.send(render_items("Active work", items))
++
++        @work_cmd.command(name="add")
++        async def work_add(ctx: commands.Context, *, text: str) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            today = datetime.now(self.tz).date()
++            drafts = [parse_work_item(line, today=today) for line in split_work_message(text)]
++            result = await self.work_store.log_work_message(
++                local_date=today.isoformat(),
++                raw_text=text,
++                drafts=drafts,
++                message_id=ctx.message.id,
++                channel_id=ctx.channel.id,
++                channel_name=getattr(ctx.channel, "name", "discord"),
++                logged_by=ctx.author.id,
++                source="discord-command",
++            )
++            ids = ", ".join(f"`{item_id}`" for item_id in result.get("item_ids", []))
++            await ctx.send(f"Added work item(s): {ids}.")
++
++        @work_cmd.command(name="list")
++        async def work_list(ctx: commands.Context, status: str = "active") -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            items = await self.work_store.list_items(status)
++            await ctx.send(render_items(f"Work: {status}", items))
++
++        @work_cmd.command(name="today")
++        async def work_today(ctx: commands.Context) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            await ctx.send(await self.work_store.build_focus_text(local_date))
++
++        @work_cmd.command(name="focus")
++        async def work_focus(ctx: commands.Context) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            await ctx.send(await self.work_store.build_focus_text(local_date))
++
++        @work_cmd.command(name="done")
++        async def work_done(ctx: commands.Context, item_id: int, *, note: str = "") -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            item = await self.work_store.set_item_status(item_id, "done", local_date=local_date, note=note, logged_by=ctx.author.id)
++            await ctx.send(f"Done work `{item_id}`." if item else f"No work item `{item_id}` found.")
++
++        @work_cmd.command(name="block")
++        async def work_block(ctx: commands.Context, item_id: int, *, reason: str = "") -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            item = await self.work_store.set_item_status(item_id, "blocked", local_date=local_date, note=reason, logged_by=ctx.author.id)
++            await ctx.send(f"Blocked work `{item_id}`." if item else f"No work item `{item_id}` found.")
++
++        @work_cmd.command(name="wait")
++        async def work_wait(ctx: commands.Context, item_id: int, *, reason: str = "") -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            item = await self.work_store.set_item_status(item_id, "waiting", local_date=local_date, note=reason, logged_by=ctx.author.id)
++            await ctx.send(f"Waiting work `{item_id}`." if item else f"No work item `{item_id}` found.")
++
++        @work_cmd.command(name="cancel")
++        async def work_cancel(ctx: commands.Context, item_id: int, *, reason: str = "") -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            item = await self.work_store.set_item_status(item_id, "cancelled", local_date=local_date, note=reason, logged_by=ctx.author.id)
++            await ctx.send(f"Cancelled work `{item_id}`." if item else f"No work item `{item_id}` found.")
++
++        @work_cmd.command(name="info")
++        async def work_info(ctx: commands.Context, *, query: str) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            results = await self.work_store.search_context(query)
++            await ctx.send(render_search_results(query, results))
++
++        @work_cmd.command(name="improve")
++        async def work_improve(ctx: commands.Context, *, idea: str) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            improvement_id = await self.work_store.add_improvement(
++                idea=idea,
++                local_date=local_date,
++                source="discord-command",
++                message_id=ctx.message.id,
++                channel_id=ctx.channel.id,
++                logged_by=ctx.author.id,
++            )
++            await ctx.send(f"Added work improvement `{improvement_id}`.")
++
++        @work_cmd.command(name="review")
++        async def work_review(ctx: commands.Context) -> None:
++            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
++                return
++            local_date = datetime.now(self.tz).date().isoformat()
++            path = await self.work_store.daily_review(local_date)
++            await ctx.send(f"Wrote work review: `{path}`.")
+ 
+         @self.command(name="testprayer")
+         async def testprayer(ctx: commands.Context, prayer_name: str = "Dhuhr") -> None:
+             if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                 return
+diff --git a/docs/DISCORD_TRACKER.md b/docs/DISCORD_TRACKER.md
+--- a/docs/DISCORD_TRACKER.md
++++ b/docs/DISCORD_TRACKER.md
+@@ -16,6 +16,9 @@ Create `.env.discord-tracker` in the workspace root:
+ PRAYER_CHANNEL_NAME=prayer-tracker
+ HYDRATION_CHANNEL_NAME=habits
+ FINANCE_CHANNEL_NAME=finance-tracker
++WORK_CHANNEL_NAME=work-tracker
++WORK_MORNING_PLAN_HOUR=14
++WORK_SHUTDOWN_REVIEW_HOUR=23
+ LIFEOS_ROOT=/home/ubuntu/hermis-life-os
+ TRACKER_DB=/home/ubuntu/hermis-life-os/data/lifeos_tracker.db
+ TIMEZONE=Africa/Casablanca
+@@ -41,3 +45,4 @@ Create these channels, or override the names in env:
+ - `#prayer-tracker`
+ - `#habits`
+ - `#finance-tracker`
++- `#work-tracker`
+@@ -145 +150,16 @@ Default currency is `MAD`. Non-MAD entries keep original currency and are not
+ normalized to MAD unless a later correction provides the MAD amount.
++
++Work capture watches owner messages in `#work-tracker` (or `WORK_CHANNEL_NAME`).
++Normal text is captured as one or more work items. The assistant stores work in
++the same tracker DB, appends daily logs to `data/work/`, mirrors current tasks to
++`state/work.md`, and writes work reviews to `reports/work/`.
++
++Work examples:
++
++```text
++todo: send client update priority:p1 due:2026-05-04 project:Acme @email #client 20m
++urgent fix deployment issue today project:Hermes @code
++blocked: waiting for invoice details project:Admin
++```
++
++See `docs/WORK_ASSISTANT.md` for the full work assistant contract.
+@@ -186,3 +206,14 @@ Finance memory policy:
+ - `!money edit <id|tx:id|review:id> <corrected text>` updates a transaction or resolves a review. For reviews, corrected text can contain multiple lines.
+ - `!money void <id|tx:id|review:id>` voids a transaction or review item.
++- `!work` or `!work list` shows active work.
++- `!work add <task>` adds work; multiline text creates multiple tasks.
++- `!work today` shows today's focus plan.
++- `!work focus` shows the next recommended work items.
++- `!work done <id>` marks work done.
++- `!work block <id> <reason>` marks work blocked.
++- `!work wait <id> <reason>` marks work waiting.
++- `!work cancel <id> <reason>` cancels work.
++- `!work info <query>` searches compiled/local Life OS context.
++- `!work improve <idea>` captures a system/process improvement candidate.
++- `!work review` writes `reports/work/YYYY-MM-DD.md`.
+ - `!testprayer [PrayerName]` posts a short test prayer embed for smoke testing reactions.
+diff --git a/.hermes.md b/.hermes.md
+--- a/.hermes.md
++++ b/.hermes.md
+@@ -15,8 +15,10 @@ This directory is the user's Life OS workspace.
+ - reports/morning: morning reports
+ - reports/nightly: nightly processing output
+ - reports/weekly: weekly reviews
+ - data/finance: structured finance tracker logs and local-only daily finance records
++- data/work: structured work assistant logs and local-only work records
++- reports/work: work planning, shutdown reviews, and productivity retrospectives
+ - research/watchlists: topics to monitor
+ - research/nightly: overnight research summaries
+ - scripts: deterministic helper scripts
+ - manifests: source and wiki change tracking
+@@ -43,3 +45,6 @@ This directory is the user's Life OS workspace.
+ 14. Never index raw finance messages, tracker DB rows, or detailed finance logs into OpenViking by default.
+ 15. Normal finance rollups belong in weekly reports. Daily reports mention money only for commitments, promises to pay, or deadlines.
+ 16. Finance Discord input should be processed automatically by the finance review processor; manual money commands are fallback only.
++17. Work assistant state lives in `state/work.md`, `data/work/`, and `reports/work/`; use those before raw work captures.
++18. Do not index raw work captures, tracker DB rows, env files, or backups by default. Index compiled work wiki/state pages only unless explicitly approved.
++19. Repeated work friction should become a `work_improvement` item before becoming automation, a checklist, or a new assistant behavior.
+diff --git a/wiki/AGENTS.md b/wiki/AGENTS.md
+--- a/wiki/AGENTS.md
++++ b/wiki/AGENTS.md
+@@ -32,2 +32,3 @@ Every page should be concise and useful.
+ - Finance is sensitive: use wiki/domains/money.md and compact daily/nightly summaries first. Do not index raw finance messages, tracker DB rows, or detailed finance logs by default.
+ - Normal finance rollups belong in weekly reports. Daily reports mention finance only for commitments, promises to pay, or deadlines.
++- Work is operational and may contain sensitive company/client context: use `wiki/domains/work.md`, `state/work.md`, and `reports/work/` first. Do not index raw work captures or tracker DB rows by default.
+@@ -60,3 +61,4 @@ When answering a Life OS question:
+ 5. If useful, file new synthesis back into the wiki.
+ 6. For money questions, prefer summarized finance sources before any raw finance log inspection.
+ 7. Treat finance review queue as an agent inbox, not user homework; process automatically and ask only when unclear.
++8. For work questions, read `state/work.md` and `reports/work/` before raw captures; prefer one concrete next action over broad productivity advice.

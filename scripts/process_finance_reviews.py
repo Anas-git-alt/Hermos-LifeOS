@@ -139,6 +139,8 @@ def agent_payload(day: str, reviews: list[dict[str, Any]]) -> dict[str, Any]:
 def run_agent(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not config.agent_cmd or not payload.get("reviews"):
         return None
+    env = os.environ.copy()
+    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
     completed = subprocess.run(
         config.agent_cmd,
         input=json.dumps(payload, ensure_ascii=False),
@@ -146,6 +148,7 @@ def run_agent(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
         shell=True,
         check=False,
         capture_output=True,
+        env=env,
     )
     if completed.returncode != 0:
         return {"error": completed.stderr.strip() or f"agent exited {completed.returncode}"}

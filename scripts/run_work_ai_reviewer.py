@@ -59,7 +59,9 @@ Required JSON shape:
           "project": "optional",
           "area": "optional",
           "due_date": "2026-05-04",
+          "due_at": "16:30",
           "scheduled_date": null,
+          "scheduled_at": null,
           "energy": "medium",
           "effort_minutes": 30,
           "context": "email",
@@ -92,7 +94,7 @@ def main() -> int:
     default_hermes = str(lifeos_alias) if lifeos_alias.exists() else "hermes"
     hermes = os.environ.get("HERMIS_WORK_AI_CMD", default_hermes)
     env = os.environ.copy()
-    env.setdefault("HERMES_HOME", "/home/ubuntu/.hermes/profiles/lifeos")
+    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
     completed = subprocess.run(
         [hermes, "-z", _prompt(payload)],
         text=True,

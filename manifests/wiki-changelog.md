@@ -4,6 +4,53 @@ All meaningful wiki updates are logged here with sources and affected pages.
 
 ---
 
+## 2026-05-03
+
+### Invoice Task Cancellation Cleanup
+- **Pages updated**: 
+  - `wiki/current-state.md`
+  - `wiki/domains/work.md`
+  - `wiki/commitments.md`
+  - `wiki/open-questions.md`
+- **Sources**: 
+  - `state/tasks.md` (task-20260430-invoice cancelled 2026-05-02)
+  - `state/commitments.md` (9or3a financing active)
+- **Changes**:
+  - Updated all relevant pages to reflect cancelled invoice task (task-20260430-invoice)
+  - Removed overdue invoice references from current-state, work, commitments wikis
+  - Closed open question q-20260430-invoice-steps (resolved as task cancelled)
+  - Added active 9or3a financing commitment to wiki/commitments.md
+  - Updated last_updated dates to 2026-05-03
+- **Missing files noted**:
+  - `memory/ledger/latest` not found
+  - `reports/nightly/latest` not found
+- **Confidence**: high
+- **User action**: None required
+
+### Wiki Updates from 2026-05-03 Nightly Reports
+- **Pages updated**: 
+  - `wiki/open-questions.md`
+  - `wiki/domains/money.md`
+  - `wiki/current-state.md`
+- **Sources**: 
+  - `reports/nightly/2026-05-03-finance-processing.md`
+  - `reports/nightly/2026-05-03-finance.md`
+  - `reports/nightly/2026-05-03-memory-review.md`
+  - `inbox/needs-answer/2026-05-03-finance.md`
+  - `inbox/needs-answer/2026-05-03-memory.md`
+- **Changes**:
+  - Added two pending questions to open-questions.md (finance review:3, 9or3a placement)
+  - Added 9or3a financing recurring item to wiki/domains/money.md
+  - Updated current-state.md to include 9or3a financing commitment
+  - Updated last_updated dates to 2026-05-03
+- **Missing files noted**:
+  - `memory/ledger/latest` not found
+  - `reports/nightly/latest` not found
+- **Confidence**: high
+- **User action**: None required
+
+---
+
 ## 2026-05-02
 
 ### Money Wiki Populated
