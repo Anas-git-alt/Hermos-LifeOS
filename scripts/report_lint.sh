@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
 DAY="${1:-$(date +%F)}"
 REPORT="$ROOT/reports/morning/$DAY.md"
+YESTERDAY="$(date -d "$DAY -1 day" +%F)"
+DAILY_SUMMARY="$ROOT/data/daily-summary/$YESTERDAY.md"
 JOBS="${HERMES_LIFEOS_JOBS:-/home/ubuntu/.hermes/profiles/lifeos/cron/jobs.json}"
 FAIL=0
 
@@ -48,6 +50,14 @@ if [ -f "$REPORT" ]; then
     ok "no latest-not-found text"
   fi
 
+  if [ -f "$DAILY_SUMMARY" ]; then
+    if grep -Eq "Prayer entries: 0|Hydration daily count: 0|No deen anchor found|No health anchor found" "$REPORT"; then
+      fail "morning report ignored populated tracker daily summary: $DAILY_SUMMARY"
+    else
+      ok "morning report uses tracker daily summary"
+    fi
+  fi
+
   if grep -Fqi "unverified" "$REPORT" && grep -Eiq "recommend(s|ed)? .*(buy|purchase|install|deploy|subscribe)" "$REPORT"; then
     warn "unverified research appears near recommendation language; review manually"
   fi
@@ -66,11 +76,30 @@ if not job:
     print("FAIL: Discord morning summary cron job missing")
     raise SystemExit(1)
 prompt = job.get("prompt", "")
+morning = next((j for j in jobs if j.get("id") == "4d661d5b4b5d"), None)
+if not morning:
+    print("FAIL: morning report cron job missing")
+    raise SystemExit(1)
+morning_prompt = morning.get("prompt", "")
+if "scripts/build_morning_report.py" not in morning_prompt:
+    print("FAIL: morning report cron does not call LLM review runner")
+    raise SystemExit(1)
+if "Hermes lifeos agent" not in morning_prompt or "retries/refines" not in morning_prompt:
+    print("FAIL: morning report cron prompt does not identify Hermes LLM retry runner")
+    raise SystemExit(1)
+print("OK: morning report cron calls Hermes LLM retry runner")
+
 if "using send_message" in prompt or "Then send this summary" in prompt:
     print("FAIL: Discord morning summary prompt still instructs manual send")
     raise SystemExit(1)
 if "Do not call send_message" not in prompt:
     print("FAIL: Discord morning summary prompt lacks send_message guard")
+    raise SystemExit(1)
+if "scripts/build_discord_morning_summary.py" not in prompt:
+    print("FAIL: Discord morning summary cron does not call LLM review runner")
+    raise SystemExit(1)
+if "Hermes lifeos agent" not in prompt or "retries/refines" not in prompt:
+    print("FAIL: Discord morning summary cron prompt does not identify Hermes LLM retry runner")
     raise SystemExit(1)
 discord_required = [
     "Overnight system status",
@@ -78,6 +107,7 @@ discord_required = [
     "memory review result",
     "needs-answer",
     "Do not mention resolved finance reviews as blockers",
+    "Prayer / Hydration",
 ]
 missing_discord = [item for item in discord_required if item not in prompt]
 if missing_discord:
@@ -138,8 +168,28 @@ if memory.get("schedule", {}).get("expr") != "10 2 * * *":
     print(f"WARN: memory review cron schedule is {memory.get('schedule', {}).get('expr')!r}")
 print("OK: nightly memory review cron sane")
 
+work = next((j for j in jobs if j.get("id") == "work-review-autoprocess"), None)
+if not work:
+    print("FAIL: work review auto processor cron job missing")
+    raise SystemExit(1)
+if not work.get("enabled", True) or work.get("state") == "paused":
+    print("FAIL: work review auto processor cron job is not active")
+    raise SystemExit(1)
+work_prompt = work.get("prompt", "")
+for required_item in ["scripts/process_work_reviews.py", "--all-open"]:
+    if required_item not in work_prompt:
+        print(f"FAIL: work review cron prompt missing {required_item}")
+        raise SystemExit(1)
+if work.get("deliver") != "local":
+    print(f"FAIL: work review cron deliver target is {work.get('deliver')!r}")
+    raise SystemExit(1)
+if work.get("schedule", {}).get("expr") != "15 1 * * *":
+    print(f"WARN: work review cron schedule is {work.get('schedule', {}).get('expr')!r}")
+print("OK: work review cron sane")
+
 expected = {
     "finance-review-autoprocess": "0 1 * * *",
+    "work-review-autoprocess": "15 1 * * *",
     "180421089e9e": "30 1 * * *",
     memory.get("id"): "10 2 * * *",
     "c70e18134a87": "30 2 * * *",

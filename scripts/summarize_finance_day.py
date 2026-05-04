@@ -74,7 +74,39 @@ def fetch_open_reviews(con: sqlite3.Connection) -> list[tuple[int, str, str, str
     ).fetchall()
 
 
-def render_report(day: str, finance: dict, recurring: list[tuple], reviews: list[tuple]) -> str:
+def extract_section(text: str, heading: str) -> list[str]:
+    lines = text.splitlines()
+    out: list[str] = []
+    in_section = False
+    marker = f"## {heading}"
+    for line in lines:
+        if line.strip() == marker:
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section and line.strip():
+            out.append(line.rstrip())
+    return out
+
+
+def fetch_manual_recurring_items(wiki_path: Path) -> list[str]:
+    if not wiki_path.exists():
+        return []
+    return [
+        line
+        for line in extract_section(wiki_path.read_text(encoding="utf-8"), "Manual Recurring Items")
+        if line.startswith("- ")
+    ]
+
+
+def render_report(
+    day: str,
+    finance: dict,
+    recurring: list[tuple],
+    reviews: list[tuple],
+    manual_recurring: list[str],
+) -> str:
     lines = [
         f"# Finance Nightly Summary - {day}",
         "",
@@ -102,6 +134,9 @@ def render_report(day: str, finance: dict, recurring: list[tuple], reviews: list
     else:
         lines.append("- none")
 
+    lines.extend(["", "## Manual Recurring Items"])
+    lines.extend(manual_recurring or ["- none"])
+
     lines.extend(["", "## Open Review Items"])
     if reviews:
         for review_id, local_date, reason, raw_text in reviews:
@@ -122,7 +157,14 @@ def render_report(day: str, finance: dict, recurring: list[tuple], reviews: list
     return "\n".join(lines)
 
 
-def render_money_wiki(day: str, report_path: Path, finance: dict, recurring: list[tuple], reviews: list[tuple]) -> str:
+def render_money_wiki(
+    day: str,
+    report_path: Path,
+    finance: dict,
+    recurring: list[tuple],
+    reviews: list[tuple],
+    manual_recurring: list[str],
+) -> str:
     recurring_text = "\n".join(
         f"- {name}: {kind}, {amount} {currency}, {category}"
         for name, kind, amount, currency, category in recurring
@@ -132,6 +174,7 @@ def render_money_wiki(day: str, report_path: Path, finance: dict, recurring: lis
         for category, amount in sorted(finance["by_category"].items())
     ) or "- none"
     review_text = f"{len(reviews)} open review item(s)" if reviews else "none"
+    manual_recurring_text = "\n".join(manual_recurring) or "- none"
     return f"""---
 status: active
 last_updated: {day}
@@ -163,6 +206,10 @@ Hermis tracks finance through the Discord finance tracker, the local SQLite trac
 
 {recurring_text}
 
+## Manual Recurring Items
+
+{manual_recurring_text}
+
 ## Sources
 
 - {report_path.relative_to(report_path.parents[2])}
@@ -183,11 +230,15 @@ def main() -> int:
         recurring = fetch_recurring(con)
         reviews = fetch_open_reviews(con)
 
+    wiki_path = config.root / "wiki" / "domains" / "money.md"
+    manual_recurring = fetch_manual_recurring_items(wiki_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render_report(day, finance, recurring, reviews), encoding="utf-8")
+    output.write_text(render_report(day, finance, recurring, reviews, manual_recurring), encoding="utf-8")
     if not args.no_wiki:
-        wiki_path = config.root / "wiki" / "domains" / "money.md"
-        wiki_path.write_text(render_money_wiki(day, output, finance, recurring, reviews), encoding="utf-8")
+        wiki_path.write_text(
+            render_money_wiki(day, output, finance, recurring, reviews, manual_recurring),
+            encoding="utf-8",
+        )
     print(f"wrote finance summary: {output}")
     return 0
 
