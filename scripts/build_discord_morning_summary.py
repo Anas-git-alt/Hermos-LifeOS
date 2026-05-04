@@ -69,14 +69,14 @@ def review_summary(day: date, text: str) -> Review:
 
 
 def hermes_cmd() -> list[str]:
-    lifeos = Path("/home/ubuntu/.local/bin/lifeos")
+    lifeos = Path.home() / ".local" / "bin" / "lifeos"
     hermes = os.environ.get("HERMIS_MORNING_AI_CMD", str(lifeos) if lifeos.exists() else "hermes")
     return [hermes, "-z"]
 
 
 def run_hermes(prompt: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
+    env["HERMES_HOME"] = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes" / "profiles" / "lifeos"))
     env.setdefault("LIFEOS_ROOT", str(ROOT))
     return subprocess.run(
         [*hermes_cmd(), prompt],

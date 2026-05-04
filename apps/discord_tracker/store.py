@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+from review_automation import (
+    LOW_RISK_REVERSIBLE,
+    REQUIRES_APPROVAL,
+    ReviewPrioritizer,
+    SENSITIVE_REVIEW,
+    is_sensitive_review,
+)
 
 
 class TrackerStore:
@@ -16,6 +25,7 @@ class TrackerStore:
         self.hydration_dir = self.lifeos_root / "data" / "hydration"
         self.finance_dir = self.lifeos_root / "data" / "finance"
         self.work_dir = self.lifeos_root / "data" / "work"
+        self.review_dir = self.lifeos_root / "data" / "review"
         self.work_report_dir = self.lifeos_root / "reports" / "work"
         self.state_dir = self.lifeos_root / "state"
         self.raw_capture_dir = self.lifeos_root / "raw" / "captures"
@@ -26,6 +36,7 @@ class TrackerStore:
         self.hydration_dir.mkdir(parents=True, exist_ok=True)
         self.finance_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.review_dir.mkdir(parents=True, exist_ok=True)
         self.work_report_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.raw_capture_dir.mkdir(parents=True, exist_ok=True)
@@ -273,14 +284,717 @@ class TrackerStore:
                     created_at_utc TEXT NOT NULL,
                     reviewed_at_utc TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS review_items (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    source_path TEXT,
+                    source_record_id TEXT,
+                    source_kind TEXT,
+                    ai_interpretation_json TEXT NOT NULL DEFAULT '{}',
+                    ai_validation_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    confidence TEXT,
+                    missing_context_json TEXT NOT NULL DEFAULT '[]',
+                    priority TEXT,
+                    surface_count INTEGER NOT NULL DEFAULT 0,
+                    last_surface_at TEXT,
+                    automation_policy TEXT,
+                    auto_process_reason TEXT,
+                    discord_channel_id INTEGER,
+                    discord_message_id INTEGER,
+                    discord_thread_id INTEGER,
+                    parent_discord_message_id INTEGER,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    expires_at_utc TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS discord_message_bindings (
+                    discord_message_id INTEGER NOT NULL,
+                    discord_channel_id INTEGER NOT NULL,
+                    discord_thread_id INTEGER,
+                    review_item_id TEXT NOT NULL,
+                    source_kind TEXT,
+                    source_id TEXT,
+                    source_path TEXT,
+                    action_on_reply TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    PRIMARY KEY (discord_channel_id, discord_message_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_discord_message_bindings_message
+                    ON discord_message_bindings(discord_message_id);
+
+                CREATE TABLE IF NOT EXISTS review_item_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    review_item_id TEXT,
+                    event TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS report_publications (
+                    kind TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER,
+                    created_at_utc TEXT NOT NULL,
+                    PRIMARY KEY (kind, local_date, channel_id)
+                );
                 """
             )
             _ensure_finance_transaction_schema(db)
             _ensure_work_schema(db)
+            _ensure_review_schema(db)
             db.commit()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
+
+    async def create_review_item(
+        self,
+        *,
+        kind: str,
+        title: str,
+        body: str,
+        source_path: str | None = None,
+        source_record_id: str | int | None = None,
+        source_kind: str | None = None,
+        ai_interpretation: dict[str, Any] | None = None,
+        ai_validation: dict[str, Any] | None = None,
+        status: str = "pending",
+        confidence: str | None = None,
+        missing_context: list[str] | tuple[str, ...] | str | None = None,
+        expires_at_utc: str | None = None,
+        review_item_id: str | None = None,
+        priority: str | None = None,
+        automation_policy: str | None = None,
+        auto_process_reason: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        source_record_text = str(source_record_id) if source_record_id is not None else None
+        if review_item_id:
+            item_id = review_item_id
+        elif source_path or source_record_text:
+            item_id = review_item_id_for_source(kind, source_path, source_record_text)
+        else:
+            inline_source = hashlib.sha1(f"{title}|{body}".encode("utf-8")).hexdigest()[:12]
+            item_id = review_item_id_for_source(kind, "inline", inline_source)
+        clean_status = _normalize_review_status(status)
+        expires = expires_at_utc or _default_review_expiry()
+        missing = _json_list(missing_context)
+        interpretation_json = json.dumps(ai_interpretation or {}, sort_keys=True, ensure_ascii=False)
+        validation_json = json.dumps(ai_validation or {}, sort_keys=True, ensure_ascii=False)
+        policy = automation_policy or _default_review_automation_policy(
+            {
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "source_kind": source_kind,
+                "source_path": source_path,
+                "missing_context": missing,
+            }
+        )
+        derived_priority = priority or ReviewPrioritizer().compute_priority(
+            {
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "source_kind": source_kind,
+                "source_path": source_path,
+                "status": clean_status,
+                "confidence": confidence,
+                "missing_context": missing,
+                "expires_at_utc": expires,
+                "automation_policy": policy,
+                "created_at_utc": now,
+            }
+        )
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            existing = db.execute("SELECT * FROM review_items WHERE id = ?", (item_id,)).fetchone()
+            if existing is None:
+                db.execute(
+                    """
+                    INSERT INTO review_items
+                        (id, kind, title, body, source_path, source_record_id, source_kind,
+                         ai_interpretation_json, ai_validation_json, status, confidence,
+                         missing_context_json, priority, automation_policy, auto_process_reason,
+                         created_at_utc, updated_at_utc, expires_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id,
+                        kind,
+                        title,
+                        body,
+                        source_path,
+                        source_record_text,
+                        source_kind,
+                        interpretation_json,
+                        validation_json,
+                        clean_status,
+                        confidence,
+                        json.dumps(missing, sort_keys=True, ensure_ascii=False),
+                        derived_priority,
+                        policy,
+                        auto_process_reason,
+                        now,
+                        now,
+                        expires,
+                    ),
+                )
+                _insert_review_event(
+                    db,
+                    item_id,
+                    "created",
+                    {
+                        "id": item_id,
+                        "kind": kind,
+                        "title": title,
+                        "source_kind": source_kind,
+                        "source_record_id": source_record_text,
+                        "status": clean_status,
+                    },
+                    now,
+                )
+            else:
+                next_status = existing["status"]
+                if next_status not in {"approved", "rejected", "auto_processed"}:
+                    next_status = clean_status
+                db.execute(
+                    """
+                    UPDATE review_items
+                    SET kind = ?, title = ?, body = ?, source_path = ?,
+                        source_record_id = ?, source_kind = ?,
+                        ai_interpretation_json = ?,
+                        ai_validation_json = ?,
+                        status = ?,
+                        confidence = COALESCE(?, confidence),
+                        missing_context_json = ?,
+                        priority = COALESCE(?, priority),
+                        automation_policy = COALESCE(?, automation_policy),
+                        auto_process_reason = COALESCE(?, auto_process_reason),
+                        updated_at_utc = ?,
+                        expires_at_utc = COALESCE(?, expires_at_utc)
+                    WHERE id = ?
+                    """,
+                    (
+                        kind,
+                        title,
+                        body,
+                        source_path,
+                        source_record_text,
+                        source_kind,
+                        interpretation_json,
+                        validation_json,
+                        next_status,
+                        confidence,
+                        json.dumps(missing, sort_keys=True, ensure_ascii=False),
+                        derived_priority,
+                        policy,
+                        auto_process_reason,
+                        now,
+                        expires,
+                        item_id,
+                    ),
+                )
+                _insert_review_event(
+                    db,
+                    item_id,
+                    "refreshed",
+                    {"id": item_id, "status": next_status, "source_kind": source_kind},
+                    now,
+                )
+            db.commit()
+        await self._append_review_log(
+            {
+                "event": "review_item_upsert",
+                "id": item_id,
+                "kind": kind,
+                "title": title,
+                "status": clean_status,
+                "source_kind": source_kind,
+                "source_record_id": source_record_text,
+                "created_at_utc": now,
+            }
+        )
+        await self.write_review_state_snapshot()
+        item = await self.get_review_item(item_id)
+        if item is None:
+            raise RuntimeError(f"review item not found after create: {item_id}")
+        return item
+
+    async def get_review_item(self, review_item_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM review_items WHERE id = ?", (review_item_id,)).fetchone()
+        return _review_item_row(row) if row else None
+
+    async def list_review_items(
+        self,
+        statuses: tuple[str, ...] | list[str] = ("pending", "needs_clarification", "expired"),
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        clean = tuple(_normalize_review_status(status) for status in statuses)
+        placeholders = ", ".join("?" for _ in clean)
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                f"""
+                SELECT * FROM review_items
+                WHERE status IN ({placeholders})
+                ORDER BY
+                    CASE priority WHEN 'urgent' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 1 END,
+                    CASE status WHEN 'needs_clarification' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                    COALESCE(expires_at_utc, '9999-12-31T00:00:00+00:00') ASC,
+                    COALESCE(surface_count, 0) ASC,
+                    created_at_utc ASC
+                LIMIT ?
+                """,
+                (*clean, limit),
+            ).fetchall()
+        return [_review_item_row(row) for row in rows]
+
+    async def set_review_item_status(
+        self,
+        review_item_id: str,
+        status: str,
+        *,
+        ai_interpretation: dict[str, Any] | None = None,
+        ai_validation: dict[str, Any] | None = None,
+        confidence: str | None = None,
+        missing_context: list[str] | tuple[str, ...] | str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        clean_status = _normalize_review_status(status)
+        assignments = ["status = ?", "updated_at_utc = ?"]
+        values: list[Any] = [clean_status, now]
+        if ai_interpretation is not None:
+            assignments.append("ai_interpretation_json = ?")
+            values.append(json.dumps(ai_interpretation, sort_keys=True, ensure_ascii=False))
+        if ai_validation is not None:
+            assignments.append("ai_validation_json = ?")
+            values.append(json.dumps(ai_validation, sort_keys=True, ensure_ascii=False))
+        if confidence is not None:
+            assignments.append("confidence = ?")
+            values.append(confidence)
+        if missing_context is not None:
+            assignments.append("missing_context_json = ?")
+            values.append(json.dumps(_json_list(missing_context), sort_keys=True, ensure_ascii=False))
+        values.append(review_item_id)
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            cursor = db.execute(
+                f"UPDATE review_items SET {', '.join(assignments)} WHERE id = ?",
+                tuple(values),
+            )
+            if cursor.rowcount == 0:
+                db.commit()
+                return None
+            _insert_review_event(
+                db,
+                review_item_id,
+                f"status:{clean_status}",
+                {"id": review_item_id, "status": clean_status, "note": note},
+                now,
+            )
+            db.commit()
+        await self._append_review_log(
+            {
+                "event": "review_item_status",
+                "id": review_item_id,
+                "status": clean_status,
+                "note": note,
+                "created_at_utc": now,
+            }
+        )
+        await self.write_review_state_snapshot()
+        return await self.get_review_item(review_item_id)
+
+    async def update_review_item_metadata(
+        self,
+        review_item_id: str,
+        *,
+        priority: str | None = None,
+        automation_policy: str | None = None,
+        auto_process_reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        assignments = ["updated_at_utc = ?"]
+        now = utc_now_iso()
+        values: list[Any] = [now]
+        if priority is not None:
+            assignments.append("priority = ?")
+            values.append(priority)
+        if automation_policy is not None:
+            assignments.append("automation_policy = ?")
+            values.append(automation_policy)
+        if auto_process_reason is not None:
+            assignments.append("auto_process_reason = ?")
+            values.append(auto_process_reason)
+        values.append(review_item_id)
+        with self._connect() as db:
+            cursor = db.execute(
+                f"UPDATE review_items SET {', '.join(assignments)} WHERE id = ?",
+                tuple(values),
+            )
+            if cursor.rowcount == 0:
+                db.commit()
+                return None
+            _insert_review_event(
+                db,
+                review_item_id,
+                "metadata_updated",
+                {
+                    "id": review_item_id,
+                    "priority": priority,
+                    "automation_policy": automation_policy,
+                    "auto_process_reason": auto_process_reason,
+                },
+                now,
+            )
+            db.commit()
+        await self.write_review_state_snapshot()
+        return await self.get_review_item(review_item_id)
+
+    async def mark_review_item_surfaced(
+        self,
+        review_item_id: str,
+        *,
+        parent_discord_message_id: int | None = None,
+        surface: str = "morning_digest",
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE review_items
+                SET surface_count = COALESCE(surface_count, 0) + 1,
+                    last_surface_at = ?,
+                    parent_discord_message_id = COALESCE(?, parent_discord_message_id),
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (now, parent_discord_message_id, now, review_item_id),
+            )
+            if cursor.rowcount == 0:
+                db.commit()
+                return None
+            _insert_review_event(
+                db,
+                review_item_id,
+                "surfaced",
+                {
+                    "id": review_item_id,
+                    "surface": surface,
+                    "parent_discord_message_id": parent_discord_message_id,
+                },
+                now,
+            )
+            db.commit()
+        return await self.get_review_item(review_item_id)
+
+    async def get_review_items_by_ids(self, review_item_ids: list[str]) -> list[dict[str, Any]]:
+        ids = [str(item_id) for item_id in review_item_ids if str(item_id or "").strip()]
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                f"SELECT * FROM review_items WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        loaded = [_review_item_row(row) for row in rows]
+        by_id = {item["id"]: item for item in loaded}
+        return [by_id[item_id] for item_id in ids if item_id in by_id]
+
+    async def bind_discord_message(
+        self,
+        *,
+        review_item_id: str,
+        discord_message_id: int,
+        discord_channel_id: int,
+        discord_thread_id: int | None = None,
+        source_kind: str | None = None,
+        source_id: str | int | None = None,
+        source_path: str | None = None,
+        action_on_reply: str = "add_detail",
+        parent_discord_message_id: int | None = None,
+        update_review_item_message: bool = True,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        source_id_text = str(source_id) if source_id is not None else None
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO discord_message_bindings
+                    (discord_message_id, discord_channel_id, discord_thread_id,
+                     review_item_id, source_kind, source_id, source_path,
+                     action_on_reply, created_at_utc, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(discord_channel_id, discord_message_id) DO UPDATE SET
+                    discord_thread_id = excluded.discord_thread_id,
+                    review_item_id = excluded.review_item_id,
+                    source_kind = excluded.source_kind,
+                    source_id = excluded.source_id,
+                    source_path = excluded.source_path,
+                    action_on_reply = excluded.action_on_reply,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    discord_message_id,
+                    discord_channel_id,
+                    discord_thread_id,
+                    review_item_id,
+                    source_kind,
+                    source_id_text,
+                    source_path,
+                    action_on_reply,
+                    now,
+                    now,
+                ),
+            )
+            if update_review_item_message:
+                db.execute(
+                    """
+                    UPDATE review_items
+                    SET discord_channel_id = ?,
+                        discord_message_id = ?,
+                        discord_thread_id = ?,
+                        parent_discord_message_id = COALESCE(?, parent_discord_message_id),
+                        updated_at_utc = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        discord_channel_id,
+                        discord_message_id,
+                        discord_thread_id,
+                        parent_discord_message_id,
+                        now,
+                        review_item_id,
+                    ),
+                )
+            _insert_review_event(
+                db,
+                review_item_id,
+                "discord_bound",
+                {
+                    "discord_message_id": discord_message_id,
+                    "discord_channel_id": discord_channel_id,
+                    "discord_thread_id": discord_thread_id,
+                    "action_on_reply": action_on_reply,
+                },
+                now,
+            )
+            db.commit()
+        await self._append_review_log(
+            {
+                "event": "discord_message_bound",
+                "id": review_item_id,
+                "discord_message_id": discord_message_id,
+                "discord_channel_id": discord_channel_id,
+                "created_at_utc": now,
+            }
+        )
+        await self.write_review_state_snapshot()
+        binding = await self.get_discord_binding(discord_message_id, discord_channel_id)
+        if binding is None:
+            raise RuntimeError("discord binding missing after create")
+        return binding
+
+    async def get_discord_binding(
+        self,
+        discord_message_id: int,
+        discord_channel_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            if discord_channel_id is None:
+                row = db.execute(
+                    """
+                    SELECT * FROM discord_message_bindings
+                    WHERE discord_message_id = ?
+                    ORDER BY updated_at_utc DESC
+                    LIMIT 1
+                    """,
+                    (discord_message_id,),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """
+                    SELECT * FROM discord_message_bindings
+                    WHERE discord_message_id = ? AND discord_channel_id = ?
+                    """,
+                    (discord_message_id, discord_channel_id),
+                ).fetchone()
+        return dict(row) if row else None
+
+    async def record_review_reply(
+        self,
+        *,
+        review_item_id: str,
+        raw_text: str,
+        actor_id: int | None,
+        discord_message_id: int | None,
+        discord_channel_id: int | None,
+        ai_interpretation: dict[str, Any],
+        ai_validation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        decision = str(ai_validation.get("decision") or "")
+        status = "needs_clarification" if decision == "ask_clarification" else "pending"
+        proposed_status = str(ai_validation.get("proposed_status") or "").strip()
+        if ai_validation.get("safe_to_persist") and proposed_status in REVIEW_STATUSES:
+            status = proposed_status
+        item = await self.set_review_item_status(
+            review_item_id,
+            status,
+            ai_interpretation=ai_interpretation,
+            ai_validation=ai_validation,
+            confidence=str(ai_validation.get("confidence") or ai_interpretation.get("confidence") or "low"),
+            missing_context=ai_validation.get("missing_context") or ai_interpretation.get("missing_context"),
+            note="discord_reply",
+        )
+        now = utc_now_iso()
+        with self._connect() as db:
+            _insert_review_event(
+                db,
+                review_item_id,
+                "discord_reply",
+                {
+                    "raw_text": raw_text,
+                    "actor_id": actor_id,
+                    "discord_message_id": discord_message_id,
+                    "discord_channel_id": discord_channel_id,
+                    "ai_interpretation": ai_interpretation,
+                    "ai_validation": ai_validation,
+                },
+                now,
+            )
+            db.commit()
+        await self._append_review_log(
+            {
+                "event": "review_reply",
+                "id": review_item_id,
+                "status": status,
+                "raw_text": raw_text,
+                "discord_message_id": discord_message_id,
+                "discord_channel_id": discord_channel_id,
+                "created_at_utc": now,
+            }
+        )
+        return item
+
+    async def expire_review_items(
+        self,
+        now_utc: datetime | None = None,
+        eligible_automation_policies: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        now_dt = now_utc or datetime.now(timezone.utc)
+        now = now_dt.replace(microsecond=0).isoformat()
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            policy_clause = ""
+            params: list[Any] = [now]
+            if eligible_automation_policies:
+                placeholders = ", ".join("?" for _ in eligible_automation_policies)
+                policy_clause = f"AND COALESCE(automation_policy, '') IN ({placeholders})"
+                params.extend(eligible_automation_policies)
+            rows = db.execute(
+                f"""
+                SELECT * FROM review_items
+                WHERE status IN ('pending', 'needs_clarification')
+                  AND expires_at_utc IS NOT NULL
+                  AND expires_at_utc <= ?
+                  {policy_clause}
+                ORDER BY expires_at_utc ASC
+                """,
+                tuple(params),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if ids:
+                placeholders = ", ".join("?" for _ in ids)
+                db.execute(
+                    f"""
+                    UPDATE review_items
+                    SET status = 'expired', updated_at_utc = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, *ids),
+                )
+                for item_id in ids:
+                    _insert_review_event(db, item_id, "expired", {"id": item_id}, now)
+            db.commit()
+        expired = [_review_item_row(row) for row in rows]
+        for item in expired:
+            await self._append_review_log(
+                {
+                    "event": "review_item_expired",
+                    "id": item["id"],
+                    "kind": item["kind"],
+                    "source_kind": item.get("source_kind"),
+                    "created_at_utc": now,
+                }
+            )
+        if expired:
+            await self.write_review_state_snapshot()
+        return expired
+
+    async def record_report_publication(
+        self,
+        *,
+        kind: str,
+        local_date: str,
+        channel_id: int,
+        message_id: int | None,
+    ) -> bool:
+        now = utc_now_iso()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                INSERT OR IGNORE INTO report_publications
+                    (kind, local_date, channel_id, message_id, created_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (kind, local_date, channel_id, message_id, now),
+            )
+            db.commit()
+            return cursor.rowcount > 0
+
+    async def write_review_state_snapshot(self) -> None:
+        items = await self.list_review_items(
+            ("pending", "needs_clarification", "expired"),
+            limit=80,
+        )
+        lines = [
+            "# Review Items",
+            "",
+            f"Generated: {utc_now_iso()}",
+            "Source: tracker DB review_items + discord_message_bindings",
+            "",
+        ]
+        for status in ("needs_clarification", "pending", "expired"):
+            lines.extend(["", f"## {status.replace('_', ' ').title()}"])
+            matching = [item for item in items if item["status"] == status]
+            if not matching:
+                lines.append("- none")
+                continue
+            for item in matching:
+                source = item.get("source_kind") or "unknown"
+                message = item.get("discord_message_id")
+                discord = f" discord:{message}" if message else ""
+                priority = item.get("priority") or "normal"
+                surfaced = item.get("surface_count") or 0
+                lines.append(
+                    f"- {item['id']} [{priority} {item['kind']}/{source} surfaced:{surfaced}]{discord}: {item['title']}"
+                )
+        lines.append("")
+        (self.state_dir / "review-items.md").write_text("\n".join(lines), encoding="utf-8")
 
     async def save_prayer_schedule(self, local_date: str, timings: dict[str, datetime]) -> None:
         payload = {name: value.isoformat() for name, value in timings.items()}
@@ -1081,7 +1795,21 @@ class TrackerStore:
                 ),
             )
             db.commit()
-            return int(cursor.lastrowid)
+            suggestion_id = int(cursor.lastrowid)
+        if status == "pending":
+            await self.create_review_item(
+                kind="work_suggestion" if suggestion_kind == "capture_parse" else "work_automation_review",
+                title=_work_ai_suggestion_title(suggestion_id, suggestion_kind, response),
+                body=_work_ai_suggestion_body(response),
+                source_path="state/work.md",
+                source_record_id=suggestion_id,
+                source_kind="work_ai_suggestion",
+                ai_interpretation=response,
+                status="pending",
+                confidence=str(confidence or response.get("confidence") or "low"),
+                missing_context=[str(response.get("review_reason") or "ai_suggestion_needs_review")],
+            )
+        return suggestion_id
 
     async def get_work_ai_suggestion(self, suggestion_id: int) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -1761,6 +2489,16 @@ class TrackerStore:
                     "finance_needs_review",
                     raw_text,
                 )
+                await self.create_review_item(
+                    kind="finance_review",
+                    title=f"Money needs review {review_id}",
+                    body=f"Reason: {parsed.review_reason or 'needs_review'}\n\n{raw_text}",
+                    source_path=f"raw/captures/{local_date}.md",
+                    source_record_id=review_id,
+                    source_kind="finance_parse_review",
+                    confidence="low",
+                    missing_context=[parsed.review_reason or "needs_review"],
+                )
                 return {"status": "needs_review", "created": True, "review_id": review_id}
 
             transaction_ids = []
@@ -2093,9 +2831,111 @@ class TrackerStore:
             _append_text(md_path, _md_header(directory.name, local_date))
         _append_text(md_path, markdown_row)
 
+    async def _append_review_log(self, record: dict[str, Any]) -> None:
+        timestamp = str(record.get("created_at_utc") or utc_now_iso())
+        local_date = timestamp[:10]
+        jsonl_path = self.review_dir / f"{local_date}.jsonl"
+        md_path = self.review_dir / f"{local_date}.md"
+        _append_text(jsonl_path, json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+        if not md_path.exists():
+            _append_text(
+                md_path,
+                f"# Review Log {local_date}\n\n"
+                "| Time (UTC) | Event | ID | Status | Title / Detail |\n"
+                "|---|---|---|---|---|\n",
+            )
+        _append_text(md_path, _review_md_row(record))
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+REVIEW_STATUSES = {
+    "pending",
+    "approved",
+    "rejected",
+    "needs_clarification",
+    "expired",
+    "auto_processed",
+}
+
+
+def review_item_id_for_source(kind: str, source_path: str | None, source_record_id: str | int | None) -> str:
+    source = f"{kind}|{source_path or ''}|{source_record_id or ''}"
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    clean_kind = "".join(ch if ch.isalnum() else "-" for ch in kind.lower()).strip("-") or "item"
+    return f"review-{clean_kind}-{digest}"
+
+
+def _default_review_expiry(hours: int = 18) -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0).isoformat()
+
+
+def _normalize_review_status(status: str) -> str:
+    clean = str(status or "pending").strip().lower()
+    if clean == "clarification":
+        clean = "needs_clarification"
+    if clean not in REVIEW_STATUSES:
+        raise ValueError(f"Unsupported review item status: {status}")
+    return clean
+
+
+def _json_list(value: list[str] | tuple[str, ...] | str | None) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [" ".join(str(item).split()) for item in value if " ".join(str(item).split())]
+
+
+def _json_obj(text: str | None) -> dict[str, Any]:
+    try:
+        value = json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _json_array(text: str | None) -> list[Any]:
+    try:
+        value = json.loads(text or "[]")
+    except json.JSONDecodeError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _review_item_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["ai_interpretation"] = _json_obj(item.pop("ai_interpretation_json", "{}"))
+    item["ai_validation"] = _json_obj(item.pop("ai_validation_json", "{}"))
+    item["missing_context"] = _json_array(item.pop("missing_context_json", "[]"))
+    return item
+
+
+def _insert_review_event(
+    db: sqlite3.Connection,
+    review_item_id: str | None,
+    event: str,
+    payload: dict[str, Any],
+    now: str,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO review_item_events (review_item_id, event, payload_json, created_at_utc)
+        VALUES (?, ?, ?, ?)
+        """,
+        (review_item_id, event, json.dumps(payload, sort_keys=True, ensure_ascii=False), now),
+    )
+
+
+def _review_md_row(record: dict[str, Any]) -> str:
+    logged_at = str(record.get("created_at_utc") or utc_now_iso()).replace("+00:00", "Z")
+    detail = str(record.get("title") or record.get("raw_text") or record.get("note") or "").replace("|", "\\|")
+    return (
+        f"| {logged_at} | {record.get('event')} | {record.get('id') or ''} | "
+        f"{record.get('status') or ''} | {detail} |\n"
+    )
 
 
 def _fetchone(db: sqlite3.Connection, query: str, params: tuple[Any, ...]):
@@ -2403,6 +3243,29 @@ def _work_ai_suggestion_row(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
+def _work_ai_suggestion_title(suggestion_id: int, suggestion_kind: str, response: dict[str, Any]) -> str:
+    if suggestion_kind == "capture_parse":
+        outcome = str(response.get("outcome") or "review").replace("_", " ")
+        return f"Work suggestion {suggestion_id}: {outcome}"
+    return f"Work automation message {suggestion_id}"
+
+
+def _work_ai_suggestion_body(response: dict[str, Any]) -> str:
+    if response.get("message"):
+        return str(response["message"])
+    if response.get("question"):
+        return f"Question: {response['question']}"
+    if response.get("reason"):
+        return f"Reason: {response['reason']}"
+    items = response.get("items") or []
+    if items:
+        lines = ["Proposed work items:"]
+        for item in items:
+            lines.append(f"- {item.get('title', 'untitled')} ({item.get('priority', 'p2')})")
+        return "\n".join(lines)
+    return json.dumps(response, sort_keys=True, ensure_ascii=False)
+
+
 def _work_state_lines(items: list[dict[str, Any]]) -> list[str]:
     if not items:
         return ["- none"]
@@ -2552,6 +3415,57 @@ def _ensure_work_schema(db: sqlite3.Connection) -> None:
     for name, column_type in columns.items():
         if name not in table_sql:
             db.execute(f"ALTER TABLE work_items ADD COLUMN {name} {column_type}")
+
+
+def _ensure_review_schema(db: sqlite3.Connection) -> None:
+    row = _fetchone(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_items'",
+        (),
+    )
+    if row is None:
+        return
+    table_sql = row[0] or ""
+    columns = {
+        "priority": "TEXT",
+        "surface_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_surface_at": "TEXT",
+        "automation_policy": "TEXT",
+        "auto_process_reason": "TEXT",
+    }
+    for name, column_type in columns.items():
+        if name not in table_sql:
+            db.execute(f"ALTER TABLE review_items ADD COLUMN {name} {column_type}")
+    db.execute("UPDATE review_items SET surface_count = 0 WHERE surface_count IS NULL")
+    db.execute("UPDATE review_items SET priority = 'normal' WHERE priority IS NULL")
+    db.execute(
+        """
+        UPDATE review_items
+        SET automation_policy = CASE
+            WHEN source_kind IN ('finance_parse_review', 'finance_review', 'health_review', 'family_review', 'legal_review', 'memory_review', 'durable_memory', 'identity_memory')
+                THEN ?
+            WHEN source_kind IN ('needs_answer', 'review_fallback', 'tracker_summary')
+                THEN ?
+            WHEN kind IN ('open_question', 'morning_question')
+                THEN ?
+            ELSE ?
+        END
+        WHERE automation_policy IS NULL OR automation_policy = ''
+        """,
+        (SENSITIVE_REVIEW, LOW_RISK_REVERSIBLE, LOW_RISK_REVERSIBLE, REQUIRES_APPROVAL),
+    )
+
+
+def _default_review_automation_policy(item: dict[str, Any]) -> str:
+    if is_sensitive_review(item):
+        return SENSITIVE_REVIEW
+    source_kind = str(item.get("source_kind") or "")
+    kind = str(item.get("kind") or "")
+    if source_kind in {"needs_answer", "review_fallback", "tracker_summary"}:
+        return LOW_RISK_REVERSIBLE
+    if kind in {"open_question", "morning_question"}:
+        return LOW_RISK_REVERSIBLE
+    return REQUIRES_APPROVAL
 
 
 def _insert_finance_review(

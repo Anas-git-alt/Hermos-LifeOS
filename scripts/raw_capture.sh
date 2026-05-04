@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 TEXT="${*:-}"
 
 if [ -z "$TEXT" ]; then

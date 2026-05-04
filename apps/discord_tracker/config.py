@@ -8,7 +8,8 @@ from typing import Iterable
 from dotenv import load_dotenv
 
 
-DEFAULT_ROOT = Path("/home/ubuntu/hermis-life-os")
+DEFAULT_ROOT = Path.home() / "hermis-life-os"
+DEFAULT_HERMES_HOME = Path.home() / ".hermes" / "profiles" / "lifeos"
 
 
 @dataclass(frozen=True)
@@ -20,8 +21,11 @@ class TrackerConfig:
     hydration_channel_name: str
     finance_channel_name: str
     work_channel_name: str
+    daily_plan_channel_name: str
+    review_channel_name: str
     lifeos_root: Path
     tracker_db: Path
+    hermes_home: Path
     timezone: str
     prayer_city: str
     prayer_country: str
@@ -40,6 +44,11 @@ class TrackerConfig:
     work_overdue_grace_minutes: int
     work_ai_cmd: str
     work_automation_ai_cmd: str
+    review_ai_cmd: str
+    morning_review_enabled: bool
+    morning_review_hour: int
+    morning_review_minute: int
+    review_item_expiry_hours: int
 
 
 def parse_owner_ids(raw: str | None) -> frozenset[int]:
@@ -110,8 +119,14 @@ def load_config() -> TrackerConfig:
         hydration_channel_name=os.getenv("HYDRATION_CHANNEL_NAME", "habits"),
         finance_channel_name=os.getenv("FINANCE_CHANNEL_NAME", "finance-tracker"),
         work_channel_name=os.getenv("WORK_CHANNEL_NAME", "work-tracker"),
+        daily_plan_channel_name=os.getenv("DAILY_PLAN_CHANNEL_NAME", "daily-plan"),
+        review_channel_name=os.getenv(
+            "REVIEW_CHANNEL_NAME",
+            os.getenv("DAILY_PLAN_CHANNEL_NAME", "daily-plan"),
+        ),
         lifeos_root=lifeos_root,
         tracker_db=tracker_db,
+        hermes_home=Path(os.getenv("HERMES_HOME", str(DEFAULT_HERMES_HOME))).expanduser(),
         timezone=os.getenv("TIMEZONE", "Africa/Casablanca"),
         prayer_city=os.getenv("PRAYER_CITY", "Casablanca"),
         prayer_country=os.getenv("PRAYER_COUNTRY", "Morocco"),
@@ -130,4 +145,9 @@ def load_config() -> TrackerConfig:
         work_overdue_grace_minutes=_int_env("WORK_OVERDUE_GRACE_MINUTES", 15),
         work_ai_cmd=os.getenv("HERMIS_WORK_AI_CMD", ""),
         work_automation_ai_cmd=os.getenv("HERMIS_WORK_AUTOMATION_AI_CMD", ""),
+        review_ai_cmd=os.getenv("HERMIS_REVIEW_AI_CMD", ""),
+        morning_review_enabled=_bool_env("MORNING_REVIEW_ENABLED", True),
+        morning_review_hour=_int_env("MORNING_REVIEW_HOUR", 7),
+        morning_review_minute=_int_env("MORNING_REVIEW_MINUTE", 40),
+        review_item_expiry_hours=_int_env("REVIEW_ITEM_EXPIRY_HOURS", 18),
     )

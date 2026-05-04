@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 BACKUP_DIR="${LIFEOS_BACKUP_DIR:-$ROOT/backups}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$BACKUP_DIR/hermis-life-os-$STAMP.tar.gz"

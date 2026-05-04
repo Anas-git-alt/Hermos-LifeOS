@@ -170,7 +170,7 @@ def run_agent(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not config.agent_cmd or not payload.get("captures"):
         return None
     env = os.environ.copy()
-    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
+    env["HERMES_HOME"] = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes" / "profiles" / "lifeos"))
     completed = subprocess.run(
         config.agent_cmd,
         input=json.dumps(payload, ensure_ascii=False),

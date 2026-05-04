@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import shlex
-import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
+from ai_review import AIInputInterpreter, AIValidationPass
 from config import TrackerConfig, is_owner_id, load_config
 from finance import finance_review_request, parse_finance_message
 from hydration import (
@@ -32,7 +32,13 @@ from prayer import (
     parse_prayer_footer,
     prayer_embed_text,
 )
-from store import TrackerStore
+from review_reports import (
+    build_morning_discord_summary,
+    morning_review_candidates,
+    read_morning_report,
+)
+from review_automation import ReviewDigestBuilder, ReviewPrioritizer, SafeAutoProcessor
+from store import TrackerStore, review_item_id_for_source
 from work import (
     draft_parse_work_message,
     render_work_focus,
@@ -47,6 +53,12 @@ REACTIONS_BY_KIND = {
     "prayer": tuple(PRAYER_REACTIONS.keys()),
     "hydration": tuple(HYDRATION_REACTIONS.keys()),
 }
+REVIEW_REACTIONS = {
+    "✅": "approve",
+    "❌": "reject",
+    "❓": "needs_clarification",
+    "📝": "add_detail",
+}
 
 
 class DiscordTracker(commands.Bot):
@@ -60,6 +72,11 @@ class DiscordTracker(commands.Bot):
         self.store = store
         self.tz = ZoneInfo(config.timezone)
         self.http_session: aiohttp.ClientSession | None = None
+        self.input_interpreter = AIInputInterpreter(self._run_review_ai_json)
+        self.validation_pass = AIValidationPass(self._run_review_ai_json)
+        self.review_prioritizer = ReviewPrioritizer()
+        self.review_digest_builder = ReviewDigestBuilder(self.review_prioritizer)
+        self.safe_auto_processor = SafeAutoProcessor(self.store)
         self.add_commands()
 
     async def setup_hook(self) -> None:
@@ -68,11 +85,13 @@ class DiscordTracker(commands.Bot):
         self.prayer_scheduler.start()
         self.hydration_scheduler.start()
         self.work_scheduler.start()
+        self.morning_review_scheduler.start()
 
     async def close(self) -> None:
         self.prayer_scheduler.cancel()
         self.hydration_scheduler.cancel()
         self.work_scheduler.cancel()
+        self.morning_review_scheduler.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -87,6 +106,8 @@ class DiscordTracker(commands.Bot):
         if content.startswith(str(self.command_prefix)):
             await self.process_commands(message)
             return
+        if await self._maybe_handle_review_reply(message, content):
+            return
         await self._maybe_capture_finance_message(message, content)
         await self._maybe_capture_work_message(message, content)
         await self.process_commands(message)
@@ -97,14 +118,20 @@ class DiscordTracker(commands.Bot):
         if not is_owner_id(payload.user_id, self.config.discord_owner_ids):
             return
 
-        emoji = str(payload.emoji)
-        if emoji not in PRAYER_REACTIONS and emoji not in HYDRATION_REACTIONS:
-            return
-
         channel = self.get_channel(payload.channel_id)
         if channel is None:
             channel = await self.fetch_channel(payload.channel_id)
         if not hasattr(channel, "fetch_message"):
+            return
+
+        emoji = str(payload.emoji)
+        if emoji in REVIEW_REACTIONS:
+            binding = await self.store.get_discord_binding(payload.message_id, payload.channel_id)
+            if binding:
+                await self._handle_review_reaction(payload, channel, binding, emoji)
+                return
+
+        if emoji not in PRAYER_REACTIONS and emoji not in HYDRATION_REACTIONS:
             return
 
         message = await channel.fetch_message(payload.message_id)
@@ -179,6 +206,166 @@ class DiscordTracker(commands.Bot):
                 f"Hydration logged: +{delta}. Today: {new_count}/{self.config.hydration_target_count}."
             )
 
+    async def _handle_review_reaction(self, payload, channel, binding: dict[str, Any], emoji: str) -> None:
+        action = REVIEW_REACTIONS[emoji]
+        item = await self.store.get_review_item(binding["review_item_id"])
+        if item is None:
+            LOGGER.warning("Review binding points at missing item %s", binding["review_item_id"])
+            return
+
+        if action == "approve":
+            item = await self._approve_review_item(item, note="approved via Discord reaction")
+            if item:
+                await channel.send(f"Approved review `{item['id']}`.")
+            return
+        if action == "reject":
+            item = await self._reject_review_item(item, "rejected via Discord reaction")
+            if item:
+                await channel.send(f"Rejected review `{item['id']}`.")
+            return
+        if action == "needs_clarification":
+            question = _review_followup_question(item)
+            await self.store.set_review_item_status(
+                item["id"],
+                "needs_clarification",
+                note="needs clarification via Discord reaction",
+                missing_context=item.get("missing_context") or ["user clarification"],
+            )
+            await channel.send(f"Review `{item['id']}` needs clarification. {question}")
+            return
+        if action == "add_detail":
+            await channel.send(f"Reply to review `{item['id']}` with the details you want attached.")
+
+    async def _maybe_handle_review_reply(self, message: discord.Message, content: str) -> bool:
+        if not content:
+            return False
+        if not is_owner_id(message.author.id, self.config.discord_owner_ids):
+            return False
+        reference = getattr(message, "reference", None)
+        referenced_message_id = getattr(reference, "message_id", None)
+        if referenced_message_id is None:
+            return False
+        binding = await self.store.get_discord_binding(referenced_message_id)
+        if binding is None:
+            return False
+        item = await self.store.get_review_item(binding["review_item_id"])
+        if item is None:
+            LOGGER.warning("Reply binding points at missing review item %s", binding["review_item_id"])
+            return False
+        related_items = await self.store.get_review_items_by_ids(_binding_related_review_ids(binding))
+
+        context = {
+            "review_item": item,
+            "related_review_items": related_items,
+            "binding": binding,
+            "reply": {
+                "message_id": message.id,
+                "channel_id": message.channel.id,
+                "author_id": message.author.id,
+                "content": content,
+            },
+        }
+        interpretation = await self.input_interpreter.interpret(content, context)
+        validation = await self.validation_pass.validate(interpretation, context)
+        updated = await self.store.record_review_reply(
+            review_item_id=item["id"],
+            raw_text=content,
+            actor_id=message.author.id,
+            discord_message_id=message.id,
+            discord_channel_id=message.channel.id,
+            ai_interpretation=interpretation,
+            ai_validation=validation,
+        )
+        if updated is None:
+            return True
+        linked_updates = await self._apply_related_review_reply_updates(
+            item,
+            related_items,
+            content,
+            message,
+            interpretation,
+            validation,
+        )
+
+        if validation.get("safe_to_persist") and validation.get("proposed_status") == "approved":
+            await self._approve_review_item(updated, note="approved via Discord reply")
+            suffix = _linked_reply_suffix(linked_updates)
+            await message.channel.send(f"Approved review `{item['id']}` with your added context.{suffix}")
+            return True
+        if validation.get("safe_to_persist") and validation.get("proposed_status") == "rejected":
+            await self._reject_review_item(updated, "rejected via Discord reply")
+            suffix = _linked_reply_suffix(linked_updates)
+            await message.channel.send(f"Rejected review `{item['id']}` with your note attached.{suffix}")
+            return True
+        if validation.get("decision") == "ask_clarification":
+            question = validation.get("clarification_question") or _review_followup_question(updated)
+            await message.channel.send(f"Added your reply to `{item['id']}`, but I need one clarification: {question}")
+            return True
+        suffix = _linked_reply_suffix(linked_updates)
+        await message.channel.send(f"Added your reply to review `{item['id']}`. It is still pending review.{suffix}")
+        return True
+
+    async def _apply_related_review_reply_updates(
+        self,
+        item: dict[str, Any],
+        related_items: list[dict[str, Any]],
+        content: str,
+        message: discord.Message,
+        interpretation: dict[str, Any],
+        validation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not validation.get("safe_to_persist"):
+            return []
+        if validation.get("confidence") != "high":
+            return []
+        related_ids = set(str(value) for value in validation.get("related_review_item_ids") or [])
+        if not related_ids:
+            return []
+        by_id = {related["id"]: related for related in related_items if related["id"] != item["id"]}
+        updated_items = []
+        for related_id in sorted(related_ids):
+            related = by_id.get(related_id)
+            if related is None:
+                continue
+            updated = await self.store.record_review_reply(
+                review_item_id=related["id"],
+                raw_text=content,
+                actor_id=message.author.id,
+                discord_message_id=message.id,
+                discord_channel_id=message.channel.id,
+                ai_interpretation=interpretation,
+                ai_validation=validation,
+            )
+            if updated is None:
+                continue
+            if validation.get("proposed_status") == "approved":
+                updated = await self._approve_review_item(updated, note=f"approved via linked Discord reply to {item['id']}")
+            elif validation.get("proposed_status") == "rejected":
+                updated = await self._reject_review_item(updated, f"rejected via linked Discord reply to {item['id']}")
+            if updated:
+                updated_items.append(updated)
+        return updated_items
+
+    async def _approve_review_item(self, item: dict[str, Any], *, note: str) -> dict[str, Any] | None:
+        source_kind = item.get("source_kind")
+        source_id = item.get("source_record_id")
+        if source_kind == "work_ai_suggestion" and source_id:
+            try:
+                await self.store.accept_work_ai_suggestion(int(source_id), reviewer_note=note)
+            except (TypeError, ValueError) as exc:
+                LOGGER.warning("Could not accept work suggestion %s from review %s: %s", source_id, item["id"], exc)
+        return await self.store.set_review_item_status(item["id"], "approved", note=note)
+
+    async def _reject_review_item(self, item: dict[str, Any], reason: str) -> dict[str, Any] | None:
+        source_kind = item.get("source_kind")
+        source_id = item.get("source_record_id")
+        if source_kind == "work_ai_suggestion" and source_id:
+            try:
+                await self.store.reject_work_ai_suggestion(int(source_id), reason)
+            except (TypeError, ValueError) as exc:
+                LOGGER.info("Work suggestion %s was not rejected from review %s: %s", source_id, item["id"], exc)
+        return await self.store.set_review_item_status(item["id"], "rejected", note=reason)
+
     async def _maybe_capture_finance_message(self, message: discord.Message, content: str) -> None:
         if not content:
             return
@@ -210,10 +397,22 @@ class DiscordTracker(commands.Bot):
                 f"Captured money note `{result['review_id']}` for Hermis review. "
                 f"Use `!money edit review:{result['review_id']} <corrected text>` only for immediate ledger entry."
             )
+            await self._dispatch_review_item_by_source(
+                "finance_review",
+                "raw/captures/" + local_date + ".md",
+                result["review_id"],
+                message.channel,
+            )
             return
         await message.channel.send(
             f"Money needs review `{result['review_id']}`: {reason}. "
             f"Use `!money edit review:{result['review_id']} <corrected text>`."
+        )
+        await self._dispatch_review_item_by_source(
+            "finance_review",
+            "raw/captures/" + local_date + ".md",
+            result["review_id"],
+            message.channel,
         )
 
     async def _maybe_capture_work_message(self, message: discord.Message, content: str) -> None:
@@ -249,6 +448,13 @@ class DiscordTracker(commands.Bot):
             f"Captured work note `{result['capture_id']}` for Hermis review. "
             f"Draft parse is unconfirmed.{ai_text}"
         )
+        if suggestion_id:
+            await self._dispatch_review_item_by_source(
+                "work_suggestion",
+                "state/work.md",
+                suggestion_id,
+                message.channel,
+            )
 
     async def _create_work_capture_ai_suggestion(
         self,
@@ -685,16 +891,180 @@ class DiscordTracker(commands.Bot):
         elapsed_minutes = int((now_local - start).total_seconds() // 60)
         return elapsed_minutes % self.config.hydration_interval_minutes == 0
 
+    @tasks.loop(minutes=1)
+    async def morning_review_scheduler(self) -> None:
+        await self.wait_until_ready()
+        if not self.config.morning_review_enabled:
+            return
+        now_local = datetime.now(self.tz).replace(second=0, microsecond=0)
+        if now_local.hour != self.config.morning_review_hour or now_local.minute != self.config.morning_review_minute:
+            return
+        try:
+            await self.publish_morning_report(now_local.date().isoformat())
+        except Exception:
+            LOGGER.exception("Morning review Discord publish failed")
+
+    async def publish_morning_report(
+        self,
+        local_date: str,
+        *,
+        channel=None,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        report_text = read_morning_report(self.config.lifeos_root, local_date)
+        if not report_text:
+            LOGGER.warning("Morning report missing for %s", local_date)
+            return []
+        channel = channel or await self._named_channel(self.config.review_channel_name)
+        if channel is None:
+            LOGGER.warning("Morning review channel #%s not found", self.config.review_channel_name)
+            return []
+
+        review_items: list[dict[str, Any]] = []
+        for candidate in morning_review_candidates(self.config.lifeos_root, local_date, report_text):
+            item = await self.store.create_review_item(**candidate)
+            review_items.append(item)
+
+        prioritizer = ReviewPrioritizer()
+        digest_builder = ReviewDigestBuilder(prioritizer)
+        safe_auto_processor = SafeAutoProcessor(self.store)
+
+        open_items = await self.store.list_review_items(("pending", "needs_clarification", "expired"), limit=50)
+        prioritized = prioritizer.prioritize(open_items)
+        for item in prioritized:
+            await self.store.update_review_item_metadata(
+                item["id"],
+                priority=item["priority"],
+                automation_policy=item["automation_policy"],
+            )
+
+        auto_processed = await safe_auto_processor.process_pending(prioritized)
+        open_items = await self.store.list_review_items(("pending", "needs_clarification", "expired"), limit=50)
+        digest = digest_builder.build(open_items, local_date, auto_processed=auto_processed)
+
+        should_publish = force
+        if not force:
+            should_publish = await self.store.record_report_publication(
+                kind="morning_review_inbox",
+                local_date=local_date,
+                channel_id=channel.id,
+                message_id=None,
+            )
+        digest_message = None
+        if should_publish:
+            digest_message = await channel.send(_discord_clip(digest.text, 1800))
+            if open_items:
+                await self._bind_review_digest_message(channel, digest_message, open_items)
+            for item in open_items:
+                await self.store.mark_review_item_surfaced(
+                    item["id"],
+                    parent_discord_message_id=getattr(digest_message, "id", None),
+                    surface="morning_digest",
+                )
+            if not force:
+                await self.store.record_report_publication(
+                    kind="morning_review_inbox_message",
+                    local_date=local_date,
+                    channel_id=channel.id,
+                    message_id=getattr(digest_message, "id", None),
+                )
+
+        for item in digest.cards:
+            if item.get("discord_message_id"):
+                continue
+            await self._post_review_card(channel, item)
+        return review_items
+
+    async def _bind_review_digest_message(self, channel, message, items: list[dict[str, Any]]) -> None:
+        first = items[0]
+        related_ids = ",".join(item["id"] for item in items[:12])
+        await self.store.bind_discord_message(
+            review_item_id=first["id"],
+            discord_message_id=message.id,
+            discord_channel_id=channel.id,
+            discord_thread_id=getattr(channel, "id", None) if getattr(channel, "type", None) == discord.ChannelType.public_thread else None,
+            source_kind="morning_digest",
+            source_id=related_ids,
+            source_path=None,
+            action_on_reply="morning_digest",
+            update_review_item_message=False,
+        )
+
+    async def _dispatch_review_item_by_source(
+        self,
+        kind: str,
+        source_path: str | None,
+        source_record_id: int | str,
+        channel,
+    ) -> None:
+        item_id = review_item_id_for_source(kind, source_path, source_record_id)
+        item = await self.store.get_review_item(item_id)
+        if item is None:
+            return
+        if item.get("discord_message_id"):
+            return
+        await self._post_review_card(channel, item)
+
+    async def _post_review_card(self, channel, item: dict[str, Any]):
+        embed = discord.Embed(title=item["title"], description=_review_card_body(item))
+        embed.set_footer(text=f"review:{item['id']}")
+        message = await channel.send(embed=embed)
+        for emoji in REVIEW_REACTIONS:
+            await message.add_reaction(emoji)
+        await self.store.bind_discord_message(
+            review_item_id=item["id"],
+            discord_message_id=message.id,
+            discord_channel_id=channel.id,
+            discord_thread_id=getattr(channel, "id", None) if getattr(channel, "type", None) == discord.ChannelType.public_thread else None,
+            source_kind=item.get("source_kind"),
+            source_id=item.get("source_record_id"),
+            source_path=item.get("source_path"),
+            action_on_reply="add_detail",
+        )
+        await self.store.mark_review_item_surfaced(
+            item["id"],
+            parent_discord_message_id=item.get("parent_discord_message_id"),
+            surface="review_card",
+        )
+        return message
+
+    async def _run_review_ai_json(self, prompt: str) -> dict:
+        configured = self.config.review_ai_cmd or self.config.work_ai_cmd
+        if not configured:
+            lifeos_alias = Path.home() / ".local" / "bin" / "lifeos"
+            configured = str(lifeos_alias) if lifeos_alias.exists() else "hermes"
+        args = shlex.split(configured)
+        if not args:
+            raise RuntimeError("Missing Hermis review AI command")
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(self.config.hermes_home)
+        env.setdefault("LIFEOS_ROOT", str(self.config.lifeos_root))
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            "-z",
+            prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.config.lifeos_root),
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        if proc.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(detail or f"Hermis review AI exited {proc.returncode}")
+        return _extract_json(stdout.decode("utf-8", errors="replace"))
+
     async def _run_work_ai_json(self, prompt: str, *, automation: bool) -> dict:
         configured = self.config.work_automation_ai_cmd if automation else self.config.work_ai_cmd
         if not configured:
-            lifeos_alias = Path("/home/ubuntu/.local/bin/lifeos")
+            lifeos_alias = Path.home() / ".local" / "bin" / "lifeos"
             configured = str(lifeos_alias) if lifeos_alias.exists() else "hermes"
         args = shlex.split(configured)
         if not args:
             raise RuntimeError("Missing Hermis work AI command")
         env = os.environ.copy()
-        env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
+        env["HERMES_HOME"] = str(self.config.hermes_home)
+        env.setdefault("LIFEOS_ROOT", str(self.config.lifeos_root))
         proc = await asyncio.create_subprocess_exec(
             *args,
             "-z",
@@ -903,6 +1273,12 @@ class DiscordTracker(commands.Bot):
             )
             if suggestion_id:
                 await ctx.send(f"Captured work note `{result['capture_id']}`. AI suggestion:`{suggestion_id}` pending. Use `!work accept suggestion:{suggestion_id}` if right.")
+                await self._dispatch_review_item_by_source(
+                    "work_suggestion",
+                    "state/work.md",
+                    suggestion_id,
+                    ctx.channel,
+                )
             else:
                 await ctx.send(f"Captured work note `{result['capture_id']}`. AI draft failed; raw capture is safe.")
 
@@ -1227,6 +1603,42 @@ class DiscordTracker(commands.Bot):
                 return
             await self.store.mark_work_ai_suggestion_corrected(suggestion_id, correction)
             await ctx.send(f"Corrected suggestion `{suggestion_id}`. New AI suggestion:`{new_id}` pending review.")
+
+        @self.group(name="review", invoke_without_command=True)
+        async def review_group(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            items = await self.store.list_review_items(limit=10)
+            if not items:
+                await ctx.send("No review items open.")
+                return
+            lines = ["Open review items:"]
+            for item in items:
+                priority = item.get("priority") or "normal"
+                lines.append(f"- `{item['id']}` {priority} {item['kind']} {item['status']}: {_discord_clip(item['title'], 90)}")
+            await ctx.send(_discord_clip("\n".join(lines)))
+
+        @review_group.command(name="publish")
+        async def review_publish(ctx: commands.Context) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            items = await self.store.list_review_items(limit=20)
+            posted = 0
+            for item in items:
+                if item.get("discord_message_id"):
+                    continue
+                await self._post_review_card(ctx.channel, item)
+                posted += 1
+            await ctx.send(f"Posted {posted} review card(s).")
+
+        @self.group(name="morning", invoke_without_command=True)
+        async def morning_group(ctx: commands.Context, day: str | None = None) -> None:
+            if not is_owner_id(ctx.author.id, self.config.discord_owner_ids):
+                return
+            local_date = day or datetime.now(self.tz).date().isoformat()
+            items = await self.publish_morning_report(local_date, channel=ctx.channel, force=True)
+            if not items:
+                await ctx.send(f"Morning review refreshed for {local_date}. No new review candidates.")
 
         @self.command(name="testprayer")
         async def testprayer(ctx: commands.Context, prayer_name: str = "Dhuhr") -> None:
@@ -1588,6 +2000,58 @@ def _discord_clip(text: str, limit: int = 1900) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _review_card_body(item: dict[str, Any]) -> str:
+    body = str(item.get("body") or "").strip()
+    source = item.get("source_path") or item.get("source_kind") or "unknown source"
+    missing = item.get("missing_context") or []
+    lines = [
+        _discord_clip(body, 950),
+        "",
+        f"ID: `{item['id']}`",
+        f"Status: `{item.get('status')}`",
+        f"Source: `{source}`",
+        "",
+        "React: ✅ approve | ❌ reject | ❓ clarify | 📝 add details",
+        "Or reply to this message.",
+    ]
+    if missing:
+        lines.insert(1, f"Needs: {', '.join(str(value) for value in missing[:3])}")
+    return _discord_clip("\n".join(lines), 1900)
+
+
+def _review_followup_question(item: dict[str, Any]) -> str:
+    validation = item.get("ai_validation") or {}
+    question = str(validation.get("clarification_question") or "").strip()
+    if question:
+        return question
+    missing = item.get("missing_context") or []
+    if missing:
+        return f"Can you clarify: {missing[0]}"
+    return "What should I change or add before this becomes durable truth?"
+
+
+def _binding_related_review_ids(binding: dict[str, Any]) -> list[str]:
+    ids = [str(binding.get("review_item_id") or "")]
+    if binding.get("action_on_reply") == "morning_digest":
+        raw = str(binding.get("source_id") or "")
+        ids.extend(part.strip() for part in raw.split(",") if part.strip())
+    seen: set[str] = set()
+    result = []
+    for item_id in ids:
+        if item_id and item_id not in seen:
+            seen.add(item_id)
+            result.append(item_id)
+    return result
+
+
+def _linked_reply_suffix(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    ids = ", ".join(f"`{item['id']}`" for item in items[:3])
+    more = f" and {len(items) - 3} more" if len(items) > 3 else ""
+    return f" Also updated {ids}{more}."
 
 
 async def main() -> None:

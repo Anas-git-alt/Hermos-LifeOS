@@ -82,11 +82,11 @@ def main() -> int:
         print("missing finance payload on stdin", file=sys.stderr)
         return 2
 
-    lifeos_alias = Path("/home/ubuntu/.local/bin/lifeos")
+    lifeos_alias = Path.home() / ".local" / "bin" / "lifeos"
     default_hermes = str(lifeos_alias) if lifeos_alias.exists() else "hermes"
     hermes = os.environ.get("HERMIS_FINANCE_AI_CMD", default_hermes)
     env = os.environ.copy()
-    env["HERMES_HOME"] = "/home/ubuntu/.hermes/profiles/lifeos"
+    env["HERMES_HOME"] = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes" / "profiles" / "lifeos"))
     completed = subprocess.run(
         [hermes, "-z", _prompt(payload)],
         text=True,

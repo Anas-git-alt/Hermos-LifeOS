@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 SERVICE_NAME="${DISCORD_TRACKER_SERVICE_NAME:-hermis-discord-tracker}"
 RUN_USER="${DISCORD_TRACKER_USER:-$(id -un)}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"

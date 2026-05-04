@@ -22,7 +22,7 @@ class Config:
 
 
 def load_config() -> Config:
-    root = Path(os.environ.get("LIFEOS_ROOT", "/home/ubuntu/hermis-life-os")).expanduser()
+    root = Path(os.environ.get("LIFEOS_ROOT", str(Path.home() / "hermis-life-os"))).expanduser()
     db_path = Path(
         os.environ.get("TRACKER_DB", str(root / "data" / "lifeos_tracker.db"))
     ).expanduser()

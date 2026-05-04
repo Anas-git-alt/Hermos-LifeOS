@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 FAIL=0
 
 check_ok() {
@@ -28,7 +28,7 @@ need_dir() {
 for dir in \
   raw/captures memory/ledger memory/review memory/curated wiki state \
   reports/morning reports/nightly reports/weekly research scripts \
-  apps/discord_tracker data/prayer data/hydration data/finance data/daily-summary logs backups
+  apps/discord_tracker data/prayer data/hydration data/finance data/review data/daily-summary logs backups
 do
   need_dir "$dir"
 done
@@ -89,15 +89,30 @@ required = {
     "finance_recurring_items",
     "finance_savings_goals",
     "finance_parse_reviews",
+    "review_items",
+    "discord_message_bindings",
+    "review_item_events",
 }
 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 try:
     found = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+    review_columns = {row[1] for row in con.execute("PRAGMA table_info(review_items)")}
 finally:
     con.close()
 missing = sorted(required - found)
 if missing:
     print("FAIL: missing tracker DB tables: " + ", ".join(missing))
+    raise SystemExit(1)
+required_review_columns = {
+    "priority",
+    "surface_count",
+    "last_surface_at",
+    "automation_policy",
+    "auto_process_reason",
+}
+missing_columns = sorted(required_review_columns - review_columns)
+if missing_columns:
+    print("FAIL: missing review_items columns: " + ", ".join(missing_columns))
     raise SystemExit(1)
 print("OK: tracker DB schema has required tables")
 PY

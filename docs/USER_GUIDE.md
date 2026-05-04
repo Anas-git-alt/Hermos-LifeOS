@@ -1,226 +1,442 @@
 # Hermis Life OS User Guide
 
-Hermis Life OS is a local-first personal operating system. It helps you capture messy life input, turn it into reviewed knowledge, keep current state visible, and support daily action without trusting raw notes too much.
+Hermis Life OS is a local-first personal operating system with a Discord-first
+review interface.
 
-The system is built around one simple rule:
+The filesystem and wiki remain the durable source of truth. Discord is the
+place where you usually see reports, answer questions, review suggestions,
+clarify uncertain items, and approve or reject proposed updates.
 
-> Capture first. Review before truth. Act from current state.
+Core rule:
 
-## 1. What This System Is For
+> Capture first. Review before truth. Discord for interaction. Filesystem for durability.
 
-Use Hermis Life OS to:
+## 1. What Hermis Does
 
-- Capture tasks, reminders, habits, commitments, ideas, research topics, finance notes, work notes, and emotional signals.
-- Keep raw input safe and unchanged.
-- Turn important raw input into structured state, durable memory, wiki pages, and reports.
-- Get morning, nightly, weekly, work, finance, prayer, and hydration support.
-- Ask questions later and get answers from compiled context instead of scattered notes.
+Use Hermis to:
 
-Hermis is not meant to be a dumping ground that blindly remembers everything. It is meant to be a thinking layer: raw notes stay local, useful patterns get reviewed, and only trusted summaries become long-term context.
+- Capture raw life input quickly.
+- Preserve raw evidence without rewriting it.
+- Turn useful input into reviewed state, memory, wiki pages, and reports.
+- Receive morning reports and review cards in Discord.
+- Reply naturally in Discord instead of editing files by hand.
+- Let AI interpret messy replies, then validate them before durable changes.
+- Fall back safely to nightly processing when Discord items go unanswered.
 
-## 2. Core Mental Model
+Hermis should not blindly remember everything. Raw notes are evidence. The wiki,
+state files, reports, and curated memory are reviewed understanding.
 
-Hermis has five main layers:
+## 2. The New Mental Model
 
-1. `raw/`
-   - Source truth.
-   - Messy captures, transcripts, documents, and web clips.
-   - Raw files are append-only. Do not edit or delete them.
+Hermis now has three cooperating layers:
 
-2. `memory/ledger/`
-   - Daily timeline of extracted facts, events, and signals.
-   - Still source-linked.
-   - Useful for reconstructing what happened on a day.
+```text
+Filesystem: durable truth
+raw input -> memory/ledger -> state -> wiki -> reports
 
-3. `memory/review/`
-   - Candidate durable memories.
-   - Items waiting for approval, rejection, correction, or safe auto-promotion.
+Discord: user-facing review inbox
+reports/questions/reviews -> cards -> reactions/replies -> review items
 
-4. `memory/curated/`
-   - Approved durable memory.
-   - Safe, high-confidence facts and patterns.
-   - Can be indexed for retrieval.
+AI: interpreter and reviewer
+natural language -> structured interpretation -> validation -> pending update
+```
 
-5. `wiki/` and `state/`
-   - `wiki/` is compiled understanding.
-   - `state/` is current operational truth: active tasks, commitments, habits, reminders, work focus, and research queue.
+Discord is not replacing the wiki. Discord is the front door.
 
-Reports live in `reports/`. They explain what changed and what to do next.
+If Discord delivery fails, reports and wiki output should still be written to
+the filesystem, and the failure should be visible in logs or reports.
 
-## 3. Folder Map
+## 3. Important Paths
 
-Use this map when you need to find something:
+Default paths:
 
-| Folder | Purpose |
+```bash
+HERMES_HOME=${HERMES_HOME:-$HOME/.hermes/profiles/lifeos}
+LIFEOS_ROOT=${LIFEOS_ROOT:-$HOME/hermis-life-os}
+```
+
+Main folders:
+
+| Path | Purpose |
 | --- | --- |
-| `raw/captures/` | Manual raw notes and daily captures |
-| `raw/transcripts/` | Chat or meeting transcripts |
-| `raw/documents/` | Source documents |
-| `raw/web-clips/` | Saved web source material |
-| `memory/ledger/` | Append-only daily life timeline |
-| `memory/review/` | Memory candidates waiting for review |
-| `memory/curated/` | Approved durable memories |
-| `wiki/` | Compiled life understanding |
-| `wiki/domains/` | Deen, health, work, family, money, planning |
-| `wiki/patterns/` | Sleep, energy, focus, avoidance patterns |
-| `state/` | Active tasks, reminders, commitments, habits, work state |
-| `reports/morning/` | Morning briefings |
-| `reports/nightly/` | Nightly processing output |
-| `reports/work/` | Work parsing, automation, and shutdown reports |
+| `raw/captures/` | Raw captures and Discord-derived source blocks |
+| `memory/ledger/` | Daily extracted timeline and source-linked facts |
+| `memory/review/` | Durable memory candidates waiting for review |
+| `memory/curated/` | Approved durable memory |
+| `memory/approved/` | Approved memory records from review runs |
+| `wiki/` | Durable compiled understanding |
+| `state/` | Current operational state |
+| `state/review-items.md` | Current generic review inbox snapshot |
+| `reports/morning/` | Morning reports |
+| `reports/nightly/` | Nightly processing and fallback reports |
+| `reports/work/` | Work parsing and shutdown reports |
 | `reports/weekly/` | Weekly audits and rollups |
 | `research/nightly/` | Research summaries |
-| `data/` | Local tracker data and structured logs |
-| `scripts/` | Helper scripts |
+| `inbox/needs-answer/` | Questions needing user input |
+| `data/review/` | Review item event logs |
+| `data/work/` | Work logs |
+| `data/finance/` | Finance logs |
+| `data/prayer/` | Prayer logs |
+| `data/hydration/` | Hydration logs |
+| `scripts/` | Local automation scripts |
 | `docs/` | System documentation |
 
-## 4. Daily Workflow
+The tracker database is usually:
+
+```bash
+${LIFEOS_ROOT}/data/lifeos_tracker.db
+```
+
+## 4. Discord Server Map
+
+The Discord layout separates active automation from future life-area surfaces.
+Discord is the front door; the filesystem and wiki remain durable truth.
+
+```text
+TEXT CHANNELS
+  #general
+
+HERMIS HOME
+  #dashboard
+    High-level Hermis status and future dashboard summaries.
+  #daily-plan
+    Daily plan and morning summary.
+  #approval-queue
+    Today's Review Inbox, approval cards, reactions, and natural-language replies.
+
+HERMIS TRACKERS
+  #prayer-tracker
+    Prayer reminders, prayer reactions, !prayertoday, !testprayer.
+  #habits
+    Hydration reminders, !water, !hydration.
+  #work-tracker
+    Work captures, work reminders, !work, !work review, !work accept.
+  #finance-tracker
+    Finance captures and review-first money notes.
+
+LIFE AREAS
+  #daily-adhkar
+  #fitness-log
+  #family-calendar
+  #wife-commitments
+  #ai-content
+  #analytics
+  #weekly-review
+
+SYSTEM
+  #system-notifications
+  #audit-log
+```
+
+Channel roles:
+
+| Category | Channel | Use | Durable truth |
+| --- | --- | --- | --- |
+| HERMIS HOME | `#dashboard` | High-level status and future dashboard summaries | `state/`, `reports/weekly/` |
+| HERMIS HOME | `#daily-plan` | Morning summary and daily plan | `reports/morning/` |
+| HERMIS HOME | `#approval-queue` | Today’s Review Inbox, generic review cards, approvals | `review_items`, `state/review-items.md`, `data/review/` |
+| HERMIS TRACKERS | `#prayer-tracker` | Prayer reminders and reaction logging | `data/prayer/` |
+| HERMIS TRACKERS | `#habits` | Hydration reminders and water logging | `data/hydration/` |
+| HERMIS TRACKERS | `#work-tracker` | Work capture and work assistant review flow | `data/work/`, `state/work.md`, `reports/work/` |
+| HERMIS TRACKERS | `#finance-tracker` | Finance notes and AI-led review-first processing | `data/finance/`, `reports/nightly/` |
+| LIFE AREAS | `#daily-adhkar` | Future adhkar prompts/logging | not baked in yet |
+| LIFE AREAS | `#fitness-log` | Future fitness and training logs | not baked in yet |
+| LIFE AREAS | `#family-calendar` | Future family schedule coordination | not baked in yet |
+| LIFE AREAS | `#wife-commitments` | Future sensitive family commitment tracking | not baked in yet |
+| LIFE AREAS | `#ai-content` | Future content ideas/drafts | not baked in yet |
+| LIFE AREAS | `#analytics` | Future personal analytics and trends | not baked in yet |
+| LIFE AREAS | `#weekly-review` | Weekly review prompts and summaries | `reports/weekly/` |
+| SYSTEM | `#system-notifications` | Automation status, failures, deployments | logs and reports |
+| SYSTEM | `#audit-log` | Future audit trail for sensitive durable changes | `review_item_events`, `data/review/` |
+
+`DAILY_PLAN_CHANNEL_NAME` should stay `daily-plan`. `REVIEW_CHANNEL_NAME` should
+be `approval-queue`, so the morning plan and the approval inbox do not blur
+together.
+
+Sync the live server layout and channel topics with:
+
+```bash
+scripts/sync_discord_layout.py
+```
+
+Use `--dry-run` first if you only want to print the intended changes.
+
+## 5. Daily Workflow
 
 ### Morning
 
-Start by reading the latest morning report:
+Normal morning flow:
+
+```text
+Nightly jobs update wiki/state/reports
+  -> morning report is written to reports/morning/YYYY-MM-DD.md
+  -> Discord summary is posted
+  -> unresolved questions become review cards
+  -> you react or reply in Discord
+```
+
+In Discord, check `#daily-plan` for the plan and `#approval-queue` for decisions.
+
+Useful commands:
+
+```text
+!morning
+!morning 2026-05-04
+!review
+!review publish
+```
+
+The morning report file remains the durable record:
 
 ```bash
 ls reports/morning
+sed -n '1,220p' reports/morning/YYYY-MM-DD.md
 ```
 
-Open the newest file, for example:
-
-```bash
-sed -n '1,220p' reports/morning/2026-05-03.md
-```
-
-Use the morning report to answer:
+Use the morning output to answer:
 
 - What matters today?
 - What is overdue?
 - What is blocked?
 - What needs a decision?
+- What needs review?
 - What is the next clear action?
 
-If there is no morning report yet, read:
+### During The Day
 
-- `wiki/current-state.md`
-- `state/tasks.md`
-- `state/commitments.md`
-- `state/work.md`
-- `wiki/open-questions.md`
+Use Discord for normal interaction:
 
-### During Day
+- `#work-tracker` for work captures.
+- `#finance-tracker` for finance notes.
+- `#prayer-tracker` for prayer reminders.
+- `#habits` for hydration reminders.
+- `#daily-plan` or review channel for reports and review cards.
 
-Capture quickly. Do not organize too early.
-
-Use CLI capture:
+You can still capture from the CLI:
 
 ```bash
 scripts/raw_capture.sh "Need to call client about invoice steps"
 ```
 
-Good capture examples:
+Do not over-format. Hermis is designed to accept messy input and ask questions
+when something is unclear.
+
+### Evening
+
+Work shutdown can be posted and written with:
 
 ```text
-remind me tomorrow 16:00 to send invoice
-slept late again, low focus until afternoon
-idea: research better energy tracker
-paid 2500 DH for 9or3a installment
-work: follow up with Youssef about API access
+!work shutdown
 ```
 
-Do not worry about perfect formatting. Hermis can classify later.
+The durable report goes to:
 
-### Evening / Night
+```text
+reports/work/YYYY-MM-DD-shutdown.md
+```
+
+### Night
 
 Nightly processing should:
 
-- Read raw captures.
-- Extract tasks, commitments, habits, facts, questions, and patterns.
-- Update `state/`.
-- Update `wiki/`.
-- Write reports.
-- Put uncertain items in `inbox/needs-answer/`.
-- Put candidate durable memories in `memory/review/`.
+- Process raw captures.
+- Run finance and work review processors.
+- Expire unanswered review cards.
+- Write unresolved review items to `inbox/needs-answer/`.
+- Update memory, state, wiki, and reports.
+- Resurface still-unclear items the next morning.
 
-Read nightly outputs:
-
-```bash
-ls reports/nightly
-```
-
-Then open the newest relevant report.
-
-### Weekly
-
-Weekly review should:
-
-- Find contradictions.
-- Find stale claims.
-- Check unresolved open questions.
-- Summarize finance patterns.
-- Summarize memory changes.
-- Keep wiki concise.
-
-Read:
+Key scripts:
 
 ```bash
-ls reports/weekly
+scripts/process_finance_reviews.py --all-open
+scripts/process_work_reviews.py --all-open
+scripts/process_review_fallback.py YYYY-MM-DD
 ```
 
-## 5. The Main Information Flow
+## 6. Review Item Lifecycle
 
-Most Life OS data should move like this:
+Generic review items are the bridge between reports/wiki/state and Discord.
+
+A review item can represent:
+
+- Morning report questions.
+- Memory candidates.
+- Finance review items.
+- Work suggestions.
+- Commitment reviews.
+- Open questions.
+- Unclear AI interpretations.
+- Report follow-ups.
+
+Lifecycle:
 
 ```text
-User capture
-  -> raw/captures
-  -> nightly review
-  -> memory/ledger
-  -> state updates
-  -> wiki updates
-  -> reports
-  -> optional memory/review
-  -> memory/curated after approval
-  -> OpenViking retrieval index if safe
+created
+  -> pending
+  -> approved
+  -> rejected
+  -> needs_clarification
+  -> expired
+  -> auto_processed
 ```
 
-Important rule: raw input is evidence, not final truth.
-
-Example:
+Where review data lives:
 
 ```text
-Raw note:
-"send invoice tomorrow, stuck because don't know first step"
-
-Hermis extracts:
-- task: send invoice
-- due date: tomorrow
-- blocker: unclear first step
-- open question: what steps are needed?
-
-State updates:
-- task added
-- open question added
-- current state mentions blocker
-
-Later correction:
-"cancel invoice task"
-
-Hermis updates:
-- task status becomes cancelled
-- open question becomes resolved
-- wiki/current-state changes
+review_items table
+discord_message_bindings table
+review_item_events table
+data/review/YYYY-MM-DD.jsonl
+data/review/YYYY-MM-DD.md
+state/review-items.md
 ```
 
-## 6. How To Capture Well
+Each review item stores:
 
-Fast captures work best when they include one or more of:
+- Stable id.
+- Kind, title, and body.
+- Source path and source record id.
+- Source kind.
+- AI interpretation JSON.
+- AI validation JSON.
+- Status, confidence, priority, and automation policy.
+- Missing context.
+- Surface count and last surfaced timestamp.
+- Discord channel/message/thread binding.
+- Created, updated, and expiry timestamps.
+
+## 7. Discord Review Cards
+
+Review cards are the normal interface for approvals and clarifications.
+
+Each card includes:
+
+- What needs review.
+- Enough context to answer.
+- A stable review id.
+- Source reference.
+- Reaction instructions.
+
+Reactions:
+
+- `✅` approve or accept.
+- `❌` reject.
+- `❓` mark as needing clarification.
+- `📝` add details by replying.
+
+Only configured owner IDs can mutate review state.
+
+Unknown reactions are ignored or logged safely.
+
+## 8. Replying In Discord
+
+When you reply directly to a bot review card, Hermis uses the Discord message
+binding to find the correct review item.
+
+Reply flow:
+
+```text
+Discord reply
+  -> binding lookup
+  -> AIInputInterpreter
+  -> AIValidationPass
+  -> pending structured update or clarification
+  -> Discord acknowledgement
+```
+
+Replies can:
+
+- Answer a question.
+- Add details.
+- Correct an AI interpretation.
+- Clarify a memory candidate.
+- Improve a report item.
+- Approve with extra context.
+- Reject with a reason.
+
+Hermis should not silently drop replies. If the AI cannot safely interpret the
+reply, it should ask a clarification or leave the item pending.
+
+## 9. AI Interpretation And Validation
+
+Hermis uses AI for unstructured natural language.
+
+`AIInputInterpreter`:
+
+- Accepts raw user text plus review context.
+- Identifies intent.
+- Links the reply to the source item when possible.
+- Extracts entities, dates, commitments, tasks, notes, corrections, answers, and proposed updates.
+- Returns structured JSON with confidence and missing context.
+
+`AIValidationPass`:
+
+- Checks ambiguity.
+- Finds missing context.
+- Looks for contradictions or unsafe assumptions.
+- Improves the structured update when possible.
+- Decides whether to ask a clarification question.
+- Returns validated structured JSON.
+
+Important rule:
+
+```text
+Raw AI output is not durable truth.
+Validated AI output is still pending unless safely automated or approved.
+```
+
+## 10. Wiki And Filesystem Truth
+
+The wiki is the durable compiled map of your life context.
+
+Start here:
+
+```text
+wiki/index.md
+```
+
+Important pages:
+
+- `wiki/current-state.md`
+- `wiki/open-questions.md`
+- `wiki/contradictions.md`
+- `wiki/decisions.md`
+- `wiki/commitments.md`
+- `wiki/domains/deen.md`
+- `wiki/domains/health.md`
+- `wiki/domains/work.md`
+- `wiki/domains/family.md`
+- `wiki/domains/money.md`
+- `wiki/domains/planning.md`
+
+State files answer what is operationally true right now:
+
+- `state/tasks.md`
+- `state/commitments.md`
+- `state/reminders.md`
+- `state/habits.md`
+- `state/research-queue.md`
+- `state/work.md`
+- `state/review-items.md`
+
+Every important wiki claim should have source context, confidence, status, and
+last-updated information when practical.
+
+Do not put raw dumps into the wiki. Use short synthesis.
+
+## 11. Capturing Well
+
+Good captures include one or more of:
 
 - What happened.
 - What needs to happen.
 - Date or time.
-- Person or project.
+- Person, project, or domain.
 - Amount or category for finance.
-- Whether it is done, blocked, waiting, cancelled, or just an idea.
+- Whether the thing is done, blocked, waiting, cancelled, or just an idea.
 
-Better captures:
+Examples:
 
 ```text
 work: submit parsing review by 18:00 today, priority high
@@ -230,7 +446,7 @@ family: call mom tomorrow after Maghrib
 research: compare energy tracking systems this week
 ```
 
-Less useful but still okay:
+Messy is still acceptable:
 
 ```text
 invoice thing
@@ -238,227 +454,30 @@ tired again
 money lunch
 ```
 
-If Hermis cannot infer enough, it should create an open question instead of guessing.
+When the input is vague, Hermis should create a review card or open question
+instead of guessing.
 
-## 7. Review Gates
+## 12. Finance Workflow
 
-Review gates keep the system trustworthy.
-
-Hermis should not blindly convert every raw note into permanent truth. Sensitive or uncertain items must pass review.
-
-### Safe To Promote Faster
-
-Usually safe:
-
-- Source-backed recurring patterns.
-- Completed research status.
-- Confirmed task status.
-- Non-sensitive habits.
-- Stable preferences confirmed more than once.
-
-### Needs Review
-
-Needs user review:
-
-- Money terms.
-- Personal commitments with financial or legal impact.
-- Contradictory claims.
-- Sensitive family or health claims.
-- Anything inferred from vague text.
-- Anything that would affect future decisions if wrong.
-
-### Open Questions
-
-If something is unclear, it goes to:
-
-```text
-wiki/open-questions.md
-inbox/needs-answer/
-```
-
-Answer these regularly. The system gets much smarter when open questions are closed.
-
-## 8. Wiki Workflow
-
-The wiki is the compiled map of your life context.
-
-Start here:
-
-```text
-wiki/index.md
-```
-
-Key pages:
-
-- `wiki/current-state.md`
-- `wiki/open-questions.md`
-- `wiki/contradictions.md`
-- `wiki/decisions.md`
-- `wiki/commitments.md`
-
-Domain pages:
-
-- `wiki/domains/deen.md`
-- `wiki/domains/health.md`
-- `wiki/domains/work.md`
-- `wiki/domains/family.md`
-- `wiki/domains/money.md`
-- `wiki/domains/planning.md`
-
-Pattern pages:
-
-- `wiki/patterns/sleep-patterns.md`
-- `wiki/patterns/focus-patterns.md`
-- `wiki/patterns/avoidance-patterns.md`
-- `wiki/patterns/energy-patterns.md`
-
-Every important wiki claim should have:
-
-- Source path.
-- Source date.
-- Confidence.
-- Status.
-- Last updated date.
-
-Do not write raw dumps into the wiki. Write short, useful synthesis.
-
-## 9. State Workflow
-
-`state/` is the operational dashboard.
-
-Use:
-
-- `state/tasks.md` for active or historical tasks.
-- `state/commitments.md` for obligations and promises.
-- `state/reminders.md` for reminders.
-- `state/habits.md` for habit state.
-- `state/research-queue.md` for research topics.
-- `state/work.md` for current confirmed work and work automation status.
-
-State should answer:
-
-- What is active?
-- What is blocked?
-- What is waiting?
-- What is due?
-- What changed recently?
-- What is the next action?
-
-State is not meant to hold long explanations. Put explanations in wiki or reports.
-
-## 10. Discord Tracker Workflow
-
-The Discord sidecar supports:
-
-- Prayer tracking.
-- Hydration tracking.
-- Finance capture and review.
-- Work capture and review.
-
-Main channels:
-
-- `#prayer-tracker`
-- `#habits`
-- `#finance-tracker`
-- `#work-tracker`
-
-Run bot locally:
-
-```bash
-scripts/run_discord_tracker.sh
-```
-
-Install as service:
-
-```bash
-scripts/install_discord_tracker_service.sh
-```
-
-Service commands:
-
-```bash
-sudo systemctl status hermis-discord-tracker --no-pager
-sudo journalctl -u hermis-discord-tracker -f
-sudo systemctl restart hermis-discord-tracker
-```
-
-## 11. Prayer Workflow
-
-Prayer reminders appear in `#prayer-tracker`.
-
-React:
-
-- `✅` means on time.
-- `🕒` means late.
-- `❌` means missed.
-
-Check today:
-
-```text
-!prayertoday
-```
-
-Smoke test:
-
-```text
-!testprayer Fajr
-```
-
-Prayer data is stored in:
-
-```text
-data/prayer/
-data/lifeos_tracker.db
-```
-
-## 12. Hydration Workflow
-
-Hydration reminders appear during the configured day window.
-
-React:
-
-- `💧` adds 1 drink.
-- `🥤` adds 2 drinks.
-- `💤` snoozes reminders for 30 minutes.
-- `❌` skips that reminder.
-
-Manual log:
-
-```text
-!water 2 after walk
-```
-
-Check today:
-
-```text
-!hydration
-```
-
-Hydration data is stored in:
-
-```text
-data/hydration/
-data/lifeos_tracker.db
-```
-
-## 13. Finance Workflow
-
-Finance is sensitive. Hermis keeps raw finance messages local and does not index detailed finance logs by default.
+Finance is sensitive. Raw finance messages stay local and detailed finance logs
+should not be indexed as general memory.
 
 Normal flow:
 
 ```text
 Discord message in #finance-tracker
-  -> raw finance capture
-  -> finance review queue
-  -> Hermis AI resolver
+  -> raw capture
+  -> finance_parse_reviews
+  -> generic review item
+  -> Discord review card
+  -> AI finance resolver
   -> validated transactions
-  -> daily finance log
+  -> data/finance logs
   -> nightly/weekly summaries
-  -> wiki/domains/money.md only for compact durable understanding
+  -> compact durable money wiki updates
 ```
 
-Capture examples:
+Examples:
 
 ```text
 spent 45 lunch
@@ -485,49 +504,43 @@ Commands:
 !money void review:<id>
 ```
 
-Nightly processing:
+Nightly finance processing:
 
 ```bash
-scripts/process_finance_reviews.py <YYYY-MM-DD> --all-open
+scripts/process_finance_reviews.py YYYY-MM-DD --all-open
+scripts/summarize_finance_day.py YYYY-MM-DD
 ```
 
-Weekly rollup:
+Weekly finance rollup:
 
 ```bash
-scripts/summarize_finance_week.py <week-ending-YYYY-MM-DD>
+scripts/summarize_finance_week.py 2026-05-08
 ```
 
-Use manual `!money edit` as fallback, not normal workflow. Normal flow is AI-led review plus validation.
+Manual `!money edit` is a fallback, not the preferred path.
 
-## 14. Work Assistant Workflow
+## 13. Work Workflow
 
-Work Assistant is review-gated. Normal messages do not become final tasks immediately.
+Work is review-gated. Normal work messages do not become confirmed tasks
+immediately.
 
 Normal flow:
 
 ```text
 Message in #work-tracker
   -> work_captures row
-  -> draft parse JSON
-  -> pending AI suggestion
-  -> human review
+  -> draft_parse_json
+  -> work_ai_suggestions row
+  -> generic review item
+  -> Discord review card
   -> accept/correct/reject
-  -> confirmed work_items only after accept
-```
-
-This prevents vague notes from becoming false tasks.
-
-### Work Window
-
-Timezone:
-
-```text
-Africa/Casablanca
+  -> confirmed work_items only after approval
 ```
 
 Work window:
 
 ```text
+Africa/Casablanca
 14:00-23:00
 ```
 
@@ -538,403 +551,332 @@ Automation:
 - During work: due reminders, scheduled reminders, waiting follow-ups, overdue blocker prompts.
 - `23:00`: shutdown review and report.
 
-### Work Commands
-
-Capture:
+Commands:
 
 ```text
+!work
 !work add follow up with Youssef about API access tomorrow 16:30
-```
-
-Review:
-
-```text
 !work review
 !work accept suggestion:<id>
 !work correct suggestion:<id> <what to fix>
 !work reject suggestion:<id> <reason>
 !work clarify capture:<id> <answer>
-```
-
-View:
-
-```text
-!work
 !work list
 !work today
 !work focus
 !work automation
-```
-
-Act:
-
-```text
 !work done <id>
 !work block <id> <reason>
 !work wait <id> <reason>
 !work reschedule <id> 2026-05-04 16:30
 !work snooze <id> 30m
-```
-
-Manual plan/shutdown:
-
-```text
-!work plan
 !work shutdown
 ```
 
-Nightly review:
+Nightly work processing:
 
 ```bash
-scripts/process_work_reviews.py <YYYY-MM-DD> --all-open
+scripts/process_work_reviews.py YYYY-MM-DD --all-open
 ```
 
-Only accepted AI suggestions should create final `work_items`.
+Without `--apply`, the processor creates pending suggestions rather than final
+work items. That is the safer default.
 
-## 15. Reports Workflow
+## 14. Morning Reports
 
-Reports are how you see what Hermis did.
-
-Morning reports:
+Morning reports must always be saved to:
 
 ```text
-reports/morning/
+reports/morning/YYYY-MM-DD.md
 ```
 
-Use for daily planning.
+Then Discord receives a summary and review cards.
 
-Nightly reports:
-
-```text
-reports/nightly/
-```
-
-Use for processing results, finance review, memory review, and triage.
-
-Work reports:
-
-```text
-reports/work/
-```
-
-Use for work parsing review, automation review, and shutdown.
-
-Weekly reports:
-
-```text
-reports/weekly/
-```
-
-Use for larger audits, finance rollups, memory reviews, and wiki health.
-
-## 16. Retrieval And Memory Policy
-
-Hermis may use OpenViking for recall and retrieval, but the filesystem remains source truth.
-
-Index by default:
-
-- `wiki/`
-- User-approved `memory/curated/`
-- Safe auto-promoted curated memories
-
-Do not index by default:
-
-- `raw/`
-- `raw/documents/`
-- Tracker database rows
-- Finance raw messages
-- Detailed finance logs
-- `.env` files
-- Backups
-
-Money is especially sensitive. Prefer:
-
-1. `wiki/domains/money.md`
-2. Nightly finance summaries
-3. Weekly finance summaries
-4. Raw finance logs only when auditing or correcting
-
-## 17. Best Way To Ask Hermis Questions
-
-Good questions:
-
-```text
-What is my current top priority?
-What is overdue?
-What changed in work today?
-What open questions need answers?
-Summarize my sleep pattern from curated memory and wiki.
-What should I do first in my work window?
-What finance commitments are active?
-```
-
-Even better:
-
-```text
-Answer from wiki/current-state.md and state/work.md first.
-Check reports only if needed.
-Do not inspect raw finance logs unless needed for audit.
-```
-
-This helps Hermis use the right layer.
-
-## 18. Best Practices
-
-Use short, real captures.
-
-Review open questions often.
-
-Trust `state/` for current action, not old raw captures.
-
-Trust `wiki/` for compiled understanding, not single messy notes.
-
-Use reports to understand recent changes.
-
-Keep raw data append-only.
-
-Do not index sensitive raw data.
-
-Correct Hermis when it guesses wrong. Corrections make the system better.
-
-Prefer one clear next action over a huge plan.
-
-## 19. Common Maintenance Commands
-
-Prepare today:
+Morning report generation:
 
 ```bash
-scripts/new_day.sh
+scripts/build_morning_report.py YYYY-MM-DD
 ```
 
-Prepare a specific day:
+Discord morning summary:
 
 ```bash
-scripts/new_day.sh 2026-05-04
+scripts/build_discord_morning_summary.py YYYY-MM-DD
 ```
 
-Capture from CLI:
+Discord bot command:
+
+```text
+!morning
+!morning YYYY-MM-DD
+```
+
+The Discord morning message should include:
+
+- Summary.
+- Important items.
+- Review items.
+- Open questions.
+- Instructions to react or reply.
+
+If Discord delivery fails, the report file should still exist.
+
+## 15. Nightly Fallback
+
+Unanswered review items are not lost.
+
+Fallback flow:
+
+```text
+pending review item reaches expiry
+  -> marked expired
+  -> written to reports/nightly/YYYY-MM-DD-review-fallback.md
+  -> written to inbox/needs-answer/YYYY-MM-DD-review.md
+  -> resurfaced in next morning report and Discord review queue
+```
+
+Run:
 
 ```bash
-scripts/raw_capture.sh "your note here"
+scripts/process_review_fallback.py YYYY-MM-DD
 ```
 
-Run health check:
+Still-unclear items should remain visible until they are answered, rejected, or
+resolved through a safe automation path.
 
-```bash
-scripts/health_check.sh
+## 16. Memory Workflow
+
+Durable memory should be conservative.
+
+Flow:
+
+```text
+raw evidence
+  -> memory/ledger
+  -> memory/review
+  -> review item / Discord card when needed
+  -> memory/approved or memory/curated
+  -> wiki update
+  -> retrieval index only when safe
 ```
 
-Run health check with tests:
+Usually safe to promote faster:
 
-```bash
-scripts/health_check.sh --tests
+- Source-backed recurring patterns.
+- Completed research status.
+- Confirmed task status.
+- Non-sensitive habits.
+- Stable preferences confirmed more than once.
+
+Needs review:
+
+- Money terms.
+- Personal commitments with financial or legal impact.
+- Contradictory claims.
+- Sensitive family or health claims.
+- Anything inferred from vague text.
+- Anything that would affect future decisions if wrong.
+
+## 17. Prayer Workflow
+
+Prayer reminders appear in `#prayer-tracker`.
+
+Reactions:
+
+- `✅` means on time.
+- `🕒` means late.
+- `❌` means missed.
+
+Commands:
+
+```text
+!prayertoday
+!testprayer Fajr
 ```
 
-Run Discord tracker:
+Durable data:
+
+```text
+data/prayer/
+data/lifeos_tracker.db
+```
+
+## 18. Hydration Workflow
+
+Hydration reminders appear during the configured day window.
+
+Reactions:
+
+- `💧` adds 1 drink.
+- `🥤` adds 2 drinks.
+- `💤` snoozes reminders for 30 minutes.
+- `❌` skips that reminder.
+
+Commands:
+
+```text
+!water 2 after walk
+!hydration
+```
+
+Durable data:
+
+```text
+data/hydration/
+data/lifeos_tracker.db
+```
+
+## 19. Reports
+
+Reports explain what Hermis did.
+
+| Path | Use |
+| --- | --- |
+| `reports/morning/` | Daily plan and review surface |
+| `reports/nightly/` | Nightly processing, fallback, finance, memory |
+| `reports/work/` | Work parsing and shutdown |
+| `reports/weekly/` | Wiki audits and finance rollups |
+| `research/nightly/` | Research output |
+
+Reports should be human-readable. They should not dump raw JSON or tracker rows.
+
+## 20. Setup
+
+Create or update `.env.discord-tracker`:
+
+```dotenv
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_OWNER_IDS=
+PRAYER_CHANNEL_NAME=prayer-tracker
+HYDRATION_CHANNEL_NAME=habits
+FINANCE_CHANNEL_NAME=finance-tracker
+WORK_CHANNEL_NAME=work-tracker
+DAILY_PLAN_CHANNEL_NAME=daily-plan
+REVIEW_CHANNEL_NAME=approval-queue
+LIFEOS_ROOT=${HOME}/hermis-life-os
+TRACKER_DB=${LIFEOS_ROOT}/data/lifeos_tracker.db
+HERMES_HOME=${HOME}/.hermes/profiles/lifeos
+HERMIS_WORK_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_WORK_AUTOMATION_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_REVIEW_AI_CMD=${HOME}/.local/bin/lifeos
+TIMEZONE=Africa/Casablanca
+MORNING_REVIEW_ENABLED=true
+MORNING_REVIEW_HOUR=7
+MORNING_REVIEW_MINUTE=40
+REVIEW_ITEM_EXPIRY_HOURS=18
+```
+
+Run locally:
 
 ```bash
 scripts/run_discord_tracker.sh
 ```
 
-Process finance reviews:
+Install as systemd service:
 
 ```bash
-scripts/process_finance_reviews.py 2026-05-03 --all-open
+scripts/install_discord_tracker_service.sh
 ```
 
-Process work reviews:
+Service commands:
 
 ```bash
-scripts/process_work_reviews.py 2026-05-03 --all-open
-```
-
-Summarize finance week:
-
-```bash
-scripts/summarize_finance_week.py 2026-05-03
-```
-
-Back up workspace:
-
-```bash
-scripts/backup.sh
-```
-
-## 20. Example Full Day
-
-### 09:00
-
-Read morning report.
-
-Check:
-
-- Current priority.
-- Open questions.
-- Work focus.
-- Finance commitments.
-
-### 10:00-13:00
-
-Capture anything that appears:
-
-```bash
-scripts/raw_capture.sh "slept late, low focus until noon"
-scripts/raw_capture.sh "research topic: better energy tracking system"
-```
-
-Use Discord for prayer and hydration.
-
-### 13:00
-
-Work prep nudge appears if Discord tracker is running.
-
-Read one recommended first action.
-
-### 14:00
-
-Work start plan appears.
-
-Use:
-
-```text
-!work focus
-```
-
-### During Work
-
-Add work notes:
-
-```text
-!work add finish parser review today by 18:00
-```
-
-Review before accepting:
-
-```text
-!work review
-!work accept suggestion:<id>
-```
-
-When done:
-
-```text
-!work done <id>
-```
-
-If stuck:
-
-```text
-!work block <id> unclear next step
-```
-
-### 23:00
-
-Shutdown review appears.
-
-Answer:
-
-- What got done?
-- What is still open?
-- What is blocked?
-- What should be first tomorrow?
-
-### Night
-
-Run or read nightly processing.
-
-Check:
-
-- `reports/nightly/`
-- `reports/work/`
-- `inbox/needs-answer/`
-- `memory/review/`
-
-## 21. Troubleshooting
-
-If Discord bot is not responding:
-
-```bash
-scripts/health_check.sh
 sudo systemctl status hermis-discord-tracker --no-pager
 sudo journalctl -u hermis-discord-tracker -f
+sudo systemctl restart hermis-discord-tracker
 ```
 
-If work items do not appear:
+## 21. Discord Permissions
 
-- Check `!work review`.
-- Accept pending suggestions.
-- Run `scripts/process_work_reviews.py <YYYY-MM-DD> --all-open`.
-- Remember: raw work captures do not become final tasks until accepted.
+The bot needs:
 
-If finance entries do not appear:
+- View Channels.
+- Send Messages.
+- Embed Links.
+- Add Reactions.
+- Read Message History.
+- Message Content Intent.
 
-- Check `!money review`.
-- Run `scripts/process_finance_reviews.py <YYYY-MM-DD> --all-open`.
-- Use `!money edit review:<id> <corrected text>` only when AI review needs correction.
+Message Content Intent is required for:
 
-If current state feels stale:
+- Commands.
+- Finance capture.
+- Work capture.
+- Review-card replies.
 
-- Read latest nightly report.
-- Check `wiki/open-questions.md`.
-- Check `manifests/wiki-changelog.md`.
-- Update state from confirmed sources only.
+Only `DISCORD_OWNER_IDS` should be allowed to mutate Life OS state.
 
-If Hermis is unsure:
+## 22. Verification
 
-- It should write an open question.
-- Answer the question.
-- Re-run the relevant review flow.
-
-## 22. Golden Rules
-
-1. Raw files are source truth. Append only.
-2. Review before durable memory.
-3. Work and finance are AI-first but review-gated.
-4. State shows what to do now.
-5. Wiki shows what Hermis believes and why.
-6. Reports show what changed.
-7. Open questions are not failure; they are how the system avoids bad guesses.
-8. Sensitive raw data stays local and unindexed unless explicitly approved.
-9. Prefer one clear next action.
-10. Correct the system early when it misunderstands.
-
-## 23. Quick Start
-
-If you only do five things, do these:
-
-1. Capture everything quickly:
+Run tests:
 
 ```bash
-scripts/raw_capture.sh "note here"
+.venv-discord-tracker/bin/python -m unittest discover apps/discord_tracker/tests
 ```
 
-2. Read daily state:
+Run health check:
 
 ```bash
-sed -n '1,220p' wiki/current-state.md
-sed -n '1,220p' state/work.md
+scripts/health_check.sh --tests
 ```
 
-3. Review open questions:
+Smoke test in Discord:
 
-```bash
-sed -n '1,220p' wiki/open-questions.md
-```
+1. Run `!prayertoday`.
+2. Run `!testprayer Fajr` and react.
+3. Run `!water 1`.
+4. Post a finance note in `#finance-tracker`.
+5. Post a work note in `#work-tracker`.
+6. Run `!review publish`.
+7. Confirm review cards appear with `✅`, `❌`, `❓`, and `📝`.
+8. Reply directly to a review card.
+9. Confirm `state/review-items.md` updates.
+10. Confirm `data/review/YYYY-MM-DD.jsonl` is written.
+11. Run `scripts/process_review_fallback.py YYYY-MM-DD` with an expired item.
+12. Confirm `inbox/needs-answer/YYYY-MM-DD-review.md` is written.
 
-4. Use Discord commands:
+## 23. Troubleshooting
 
-```text
-!work review
-!work focus
-!money today
-!hydration
-!prayertoday
-```
+If Discord commands do nothing:
 
-5. Read reports:
+- Confirm the bot is running.
+- Confirm Message Content Intent is enabled.
+- Confirm channel permissions.
+- Confirm your user id is in `DISCORD_OWNER_IDS`.
 
-```bash
-ls reports/morning reports/nightly reports/work reports/weekly
-```
+If review replies are ignored:
 
-That is the system: capture, review, update state, learn patterns, act on the next clear thing.
+- Make sure you replied directly to a bot review card.
+- Check `state/review-items.md`.
+- Inspect `discord_message_bindings` in the tracker DB.
+
+If morning report Discord delivery fails:
+
+- Check that `reports/morning/YYYY-MM-DD.md` exists.
+- Check `DAILY_PLAN_CHANNEL_NAME`.
+- Check bot channel permissions.
+- Read service logs with `journalctl`.
+
+If AI interpretation fails:
+
+- Check `HERMIS_REVIEW_AI_CMD`.
+- Check `HERMES_HOME`.
+- The reply should remain attached as low-confidence context or trigger a clarification.
+
+If nightly fallback is not resurfacing items:
+
+- Run `scripts/process_review_fallback.py YYYY-MM-DD`.
+- Check `reports/nightly/YYYY-MM-DD-review-fallback.md`.
+- Check `inbox/needs-answer/YYYY-MM-DD-review.md`.
+
+## 24. Operating Principles
+
+- Discord is the inbox, not the archive.
+- Filesystem and wiki remain durable truth.
+- Raw input stays evidence.
+- AI drafts and interpretations are not final truth.
+- Important updates need validation and approval or an existing safe automation path.
+- Unanswered items should resurface, not disappear.
+- Additive changes are preferred over rewrites.
+- When unsure, ask a question instead of guessing.

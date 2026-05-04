@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 VENV="${DISCORD_TRACKER_VENV:-$ROOT/.venv-discord-tracker}"
 REQ="$ROOT/apps/discord_tracker/requirements.txt"
 STAMP="$VENV/.discord_tracker_requirements.sha256"

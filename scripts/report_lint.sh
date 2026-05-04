@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 DAY="${1:-$(date +%F)}"
 REPORT="$ROOT/reports/morning/$DAY.md"
 YESTERDAY="$(date -d "$DAY -1 day" +%F)"
 DAILY_SUMMARY="$ROOT/data/daily-summary/$YESTERDAY.md"
-JOBS="${HERMES_LIFEOS_JOBS:-/home/ubuntu/.hermes/profiles/lifeos/cron/jobs.json}"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/profiles/lifeos}"
+JOBS="${HERMES_LIFEOS_JOBS:-${HERMIS_LIFEOS_JOBS:-$HERMES_HOME/cron/jobs.json}}"
 FAIL=0
 
 ok() { echo "OK: $1"; }
@@ -187,16 +188,50 @@ if work.get("schedule", {}).get("expr") != "15 1 * * *":
     print(f"WARN: work review cron schedule is {work.get('schedule', {}).get('expr')!r}")
 print("OK: work review cron sane")
 
+review_fallback = next((j for j in jobs if j.get("id") == "review-fallback-nightly"), None)
+if not review_fallback:
+    print("FAIL: review fallback cron job missing")
+    raise SystemExit(1)
+if not review_fallback.get("enabled", True) or review_fallback.get("state") == "paused":
+    print("FAIL: review fallback cron job is not active")
+    raise SystemExit(1)
+fallback_prompt = review_fallback.get("prompt", "")
+for required_item in ["scripts/process_review_fallback.py", "YYYY-MM-DD"]:
+    if required_item not in fallback_prompt:
+        print(f"FAIL: review fallback cron prompt missing {required_item}")
+        raise SystemExit(1)
+if review_fallback.get("deliver") != "local":
+    print(f"FAIL: review fallback cron deliver target is {review_fallback.get('deliver')!r}")
+    raise SystemExit(1)
+if review_fallback.get("schedule", {}).get("expr") != "45 1 * * *":
+    print(f"WARN: review fallback cron schedule is {review_fallback.get('schedule', {}).get('expr')!r}")
+print("OK: review fallback cron sane")
+
+automation_health = next((j for j in jobs if j.get("id") == "automation-health-weekly"), None)
+if not automation_health:
+    print("FAIL: weekly automation health cron job missing")
+    raise SystemExit(1)
+health_prompt = automation_health.get("prompt", "")
+if "scripts/build_automation_health_report.py" not in health_prompt:
+    print("FAIL: weekly automation health cron prompt missing script")
+    raise SystemExit(1)
+if automation_health.get("deliver") != "local":
+    print(f"FAIL: weekly automation health deliver target is {automation_health.get('deliver')!r}")
+    raise SystemExit(1)
+print("OK: weekly automation health cron sane")
+
 expected = {
     "finance-review-autoprocess": "0 1 * * *",
     "work-review-autoprocess": "15 1 * * *",
     "180421089e9e": "30 1 * * *",
+    "review-fallback-nightly": "45 1 * * *",
     memory.get("id"): "10 2 * * *",
     "c70e18134a87": "30 2 * * *",
     "12df41197bb9": "0 3 * * *",
     "87eefd62d1c2": "25 7 * * *",
     "4d661d5b4b5d": "30 7 * * *",
     "a1abddcdcf79": "35 7 * * *",
+    "automation-health-weekly": "15 10 * * 5",
 }
 for job_id, expr in expected.items():
     scheduled = next((j for j in jobs if j.get("id") == job_id), {})

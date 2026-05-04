@@ -33,12 +33,13 @@ WORK_MID_SHIFT_CHECKIN_ENABLED=false
 WORK_SHUTDOWN_REVIEW_ENABLED=true
 WORK_REMINDER_LOOKAHEAD_MINUTES=30
 WORK_OVERDUE_GRACE_MINUTES=15
-HERMIS_WORK_AI_CMD=/home/ubuntu/.local/bin/lifeos
-HERMIS_WORK_AUTOMATION_AI_CMD=/home/ubuntu/.local/bin/lifeos
-HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos
+HERMIS_WORK_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_WORK_AUTOMATION_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_REVIEW_AI_CMD=${HOME}/.local/bin/lifeos
+HERMES_HOME=${HOME}/.hermes/profiles/lifeos
 ```
 
-Work and finance AI subprocesses force `HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos`, so inherited shell or systemd environment cannot accidentally switch profiles.
+Work, finance, and generic review AI subprocesses use `HERMES_HOME=${HERMES_HOME:-$HOME/.hermes/profiles/lifeos}`, so inherited shell or systemd environment cannot accidentally switch profiles.
 
 ## Tables
 

@@ -23,8 +23,10 @@ PRAYER_CHANNEL_NAME=prayer-tracker
 HYDRATION_CHANNEL_NAME=habits
 FINANCE_CHANNEL_NAME=finance-tracker
 WORK_CHANNEL_NAME=work-tracker
-LIFEOS_ROOT=/home/ubuntu/hermis-life-os
-TRACKER_DB=/home/ubuntu/hermis-life-os/data/lifeos_tracker.db
+DAILY_PLAN_CHANNEL_NAME=daily-plan
+REVIEW_CHANNEL_NAME=approval-queue
+LIFEOS_ROOT=${HOME}/hermis-life-os
+TRACKER_DB=${LIFEOS_ROOT}/data/lifeos_tracker.db
 TIMEZONE=Africa/Casablanca
 PRAYER_CITY=Casablanca
 PRAYER_COUNTRY=Morocco
@@ -41,9 +43,14 @@ WORK_MID_SHIFT_CHECKIN_ENABLED=false
 WORK_SHUTDOWN_REVIEW_ENABLED=true
 WORK_REMINDER_LOOKAHEAD_MINUTES=30
 WORK_OVERDUE_GRACE_MINUTES=15
-HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos
-HERMIS_WORK_AI_CMD=/home/ubuntu/.local/bin/lifeos
-HERMIS_WORK_AUTOMATION_AI_CMD=/home/ubuntu/.local/bin/lifeos
+HERMES_HOME=${HOME}/.hermes/profiles/lifeos
+HERMIS_WORK_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_WORK_AUTOMATION_AI_CMD=${HOME}/.local/bin/lifeos
+HERMIS_REVIEW_AI_CMD=${HOME}/.local/bin/lifeos
+MORNING_REVIEW_ENABLED=true
+MORNING_REVIEW_HOUR=7
+MORNING_REVIEW_MINUTE=40
+REVIEW_ITEM_EXPIRY_HOURS=18
 ```
 
 `DISCORD_OWNER_IDS` accepts comma-separated or space-separated numeric Discord user IDs. Only those users can log prayer and hydration reactions.
@@ -61,13 +68,52 @@ The bot needs:
 - Use Message Content Intent for `!prayertoday`, `!water`, and `!hydration`
 - Use Message Content Intent for finance channel capture and `!money` commands
 - Use Message Content Intent for work channel capture and `!work` commands
+- Use Message Content Intent for review-card replies and `!review` / `!morning`
 
 Create these channels, or override the names in env:
 
-- `#prayer-tracker`
-- `#habits`
-- `#finance-tracker`
-- `#work-tracker`
+Recommended server map:
+
+```text
+TEXT CHANNELS
+  #general
+
+HERMIS HOME
+  #dashboard        High-level Hermis status and future dashboard summaries
+  #daily-plan       Daily plan and morning summary
+  #approval-queue   Today's Review Inbox, review cards, reactions, replies
+
+HERMIS TRACKERS
+  #prayer-tracker   Prayer reminders and reactions
+  #habits           Hydration reminders and water logging
+  #work-tracker     Work captures, reminders, review-gated AI suggestions
+  #finance-tracker  Finance captures and review-first AI-led processing
+
+LIFE AREAS
+  #daily-adhkar
+  #fitness-log
+  #family-calendar
+  #wife-commitments
+  #ai-content
+  #analytics
+  #weekly-review
+
+SYSTEM
+  #system-notifications
+  #audit-log
+```
+
+The active baked-in channels are `#daily-plan`, `#approval-queue`,
+`#prayer-tracker`, `#habits`, `#work-tracker`, and `#finance-tracker`. The life
+area channels are intentionally documented now even when dormant, so future
+automation has stable places to land.
+
+Sync categories, missing channels, and channel topics:
+
+```bash
+scripts/sync_discord_layout.py --dry-run
+scripts/sync_discord_layout.py
+```
 
 ## Run Locally
 
@@ -77,7 +123,7 @@ scripts/run_discord_tracker.sh
 
 The script creates `.venv-discord-tracker`, installs `apps/discord_tracker/requirements.txt`, and starts the bot.
 
-Work and finance AI subprocesses force `HERMES_HOME=/home/ubuntu/.hermes/profiles/lifeos`, so systemd or shell profile drift cannot switch the Hermes profile.
+Work, finance, and generic review AI subprocesses use `HERMES_HOME=${HERMES_HOME:-$HOME/.hermes/profiles/lifeos}`, so systemd or shell profile drift cannot switch the Hermes profile unexpectedly.
 
 ## Install systemd Service
 
@@ -94,6 +140,86 @@ sudo systemctl restart hermis-discord-tracker
 ```
 
 ## Behavior
+
+## Discord-First Review Workflow
+
+The wiki and filesystem remain the durable source of truth. Discord is the main
+review inbox:
+
+```text
+reports/questions/reviews
+  -> review_items table + data/review logs + state/review-items.md
+  -> Discord review cards
+  -> owner reactions/replies
+  -> AI interpretation + AI validation
+  -> approved/rejected/clarification/pending fallback
+```
+
+Generic review items can represent morning report questions, memory candidates,
+finance review items, work suggestions, open questions, commitment reviews,
+unclear AI interpretations, and report follow-ups. Discord message bindings map
+bot messages back to source items so direct replies attach to the right Life OS
+item.
+
+Review cards use simple reactions:
+
+- `✅` approves the review item. For work AI suggestions, this calls the same
+  safe `accept_work_ai_suggestion` path used by `!work accept`.
+- `❌` rejects the review item. For pending work AI suggestions, this also
+  rejects the suggestion.
+- `❓` marks the item `needs_clarification` and posts a follow-up prompt.
+- `📝` asks you to reply with details.
+
+Only `DISCORD_OWNER_IDS` can mutate review state. Unknown reactions are ignored.
+
+Replies to review cards go through `AIInputInterpreter` and then
+`AIValidationPass`. Important changes are not silently persisted from raw AI
+output; validation must pass, and durable writes still go through an explicit
+approval or the existing safe automation flow.
+
+Morning reports continue to be written to `reports/morning/`. The cron-delivered
+Discord summary owns the normal morning report message. The bot's morning
+publisher now posts one compact `Today's Review Inbox`, grouped by urgency, and
+only posts the top actionable individual cards by default:
+
+```text
+!morning
+!morning 2026-05-04
+```
+
+The daily morning review publisher is controlled by:
+
+```dotenv
+MORNING_REVIEW_ENABLED=true
+MORNING_REVIEW_HOUR=7
+MORNING_REVIEW_MINUTE=40
+```
+
+The existing cron-delivered Discord morning summary can remain in place without
+duplicating the bot's review inbox; this layer adds durable item bindings and
+reaction/reply handling.
+
+Nightly fallback:
+
+```bash
+scripts/process_review_fallback.py <YYYY-MM-DD>
+```
+
+This safely auto-processes only high-confidence explicitly safe items, expires
+unanswered low-risk items, writes
+`reports/nightly/YYYY-MM-DD-review-fallback.md`, writes unresolved items to
+`inbox/needs-answer/YYYY-MM-DD-review.md`, and lets the next morning report and
+Discord review queue resurface anything still unclear.
+
+Weekly automation health:
+
+```bash
+scripts/build_automation_health_report.py <YYYY-MM-DD>
+```
+
+This writes `reports/weekly/YYYY-MM-DD-automation-health.md` with counts for
+auto-processed, approved, rejected, expired, resurfaced, and still-pending review
+items plus top friction sources.
 
 Prayer times are fetched daily from AlAdhan:
 
@@ -250,6 +376,9 @@ See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
 - `!work accept suggestion:<id>` accepts a pending AI suggestion and applies it if it changes work state.
 - `!work correct suggestion:<id> <what to fix>` reruns AI with your correction and keeps the old suggestion as corrected.
 - `!work reject suggestion:<id> <reason>` rejects a pending AI suggestion. Reason is required.
+- `!review` lists open generic review items.
+- `!review publish` posts unbound review cards to the current channel.
+- `!morning [YYYY-MM-DD]` publishes the morning report summary and review cards.
 - `!testprayer [PrayerName]` posts a short test prayer embed for smoke testing reactions.
 
 ## Smoke Tests
@@ -265,8 +394,11 @@ See `docs/WORK_ASSISTANT.md` for the full work assistant policy.
 9. Post two lines of expenses in one message and confirm they stay as one review item.
 10. Post `send client update tomorrow` in `#work-tracker` and confirm a work capture plus pending AI suggestion is created, not a confirmed work item.
 11. Run `!work review` and confirm it shows pending AI suggestions plus the unreviewed capture.
-12. Check `data/prayer/`, `data/hydration/`, `data/finance/`, and `data/work/` for daily `.jsonl` and `.md` files.
-13. Restart the systemd service and confirm it returns to `active (running)`.
+12. Run `!review publish` and confirm review cards have `✅`, `❌`, `❓`, and `📝`.
+13. Reply to a review card and confirm the bot acknowledges the reply instead of dropping it.
+14. Run `scripts/process_review_fallback.py <YYYY-MM-DD>` with an expired item and confirm `inbox/needs-answer/YYYY-MM-DD-review.md` is written.
+15. Check `data/prayer/`, `data/hydration/`, `data/finance/`, `data/work/`, and `data/review/` for daily `.jsonl` and `.md` files.
+16. Restart the systemd service and confirm it returns to `active (running)`.
 
 ## Tests
 
@@ -283,12 +415,16 @@ Covered areas:
 - Finance review-first capture, multi-entry resolution, storage, idempotency, edit, void, and summaries
 - Work review-first capture, draft parse isolation, multi-item confirmation, clarifications, ignored reasons, and commands storage
 - Work automation idempotency, due reminders, overdue blocker prompts, waiting follow-ups, clarification surfacing, and Casablanca work-window checks
+- Generic review item storage, Discord message bindings, review reactions, review replies, morning review digest batching, safe auto-processing, weekly automation health reporting, AI validation, and nightly fallback resurfacing
 - AlAdhan response parsing using a fixture
 
 ## Troubleshooting
 
 - If commands do nothing, enable Message Content Intent in the Discord Developer Portal and confirm the bot has channel permissions.
 - If reactions are ignored, confirm `DISCORD_OWNER_IDS` contains the numeric user ID of the reacting account.
+- If review replies are ignored, confirm the reply targets a bot review card and that `discord_message_bindings` contains the card message id.
+- If review cards do not appear, run `!review publish` and inspect `state/review-items.md`.
+- If morning review does not post, confirm `MORNING_REVIEW_ENABLED`, `DAILY_PLAN_CHANNEL_NAME`, and `REVIEW_CHANNEL_NAME`.
 - If prayer times do not load, check network access and the AlAdhan city, country, and method values.
 - If the service exits immediately, inspect `journalctl -u hermis-discord-tracker -n 100 --no-pager`.
 - If logs are not written, confirm the service user can write to `data/` and the SQLite database path.

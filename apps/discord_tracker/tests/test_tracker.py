@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -18,18 +20,29 @@ sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bot import DiscordTracker
+from ai_review import AIInputInterpreter, AIValidationPass
 from config import TrackerConfig, is_owner_id, parse_owner_ids
 from finance import finance_review_request, parse_finance_message
 from hydration import HYDRATION_REACTIONS, parse_hydration_footer
 from prayer import PRAYER_REACTIONS, parse_aladhan_timings, parse_prayer_footer
 from process_finance_reviews import apply_agent_result, apply_resolutions, fetch_reviews
+from process_review_fallback import Config as ReviewFallbackConfig, run_fallback
 from process_work_reviews import (
     apply_agent_result as apply_work_agent_result,
     apply_resolutions as apply_work_resolutions,
     create_ai_suggestions as create_work_ai_suggestions,
     fetch_captures,
 )
+from review_automation import (
+    AUTO_PROCESS_SAFE,
+    LOW_RISK_REVERSIBLE,
+    ReviewDigestBuilder,
+    ReviewPrioritizer,
+    SafeAutoProcessor,
+)
+from review_reports import build_morning_discord_summary, morning_review_candidates
 from store import TrackerStore
+from build_automation_health_report import build_report as build_automation_health_report
 from summarize_finance_week import fetch_week
 from summarize_tracker_day import fetch_finance, render
 from work import WorkItemDraft, draft_parse_work_message, item_from_manual_text
@@ -55,6 +68,10 @@ ALADHAN_FIXTURE = {
 class _FakeDiscordMessage:
     def __init__(self, message_id: int):
         self.id = message_id
+        self.reactions: list[str] = []
+
+    async def add_reaction(self, emoji: str):
+        self.reactions.append(emoji)
 
 
 class _FakeDiscordChannel:
@@ -62,10 +79,49 @@ class _FakeDiscordChannel:
 
     def __init__(self):
         self.sent: list[str] = []
+        self.embeds: list[object] = []
+        self.messages: dict[int, _FakeDiscordMessage] = {}
 
-    async def send(self, content=None, **_kwargs):
+    async def send(self, content=None, **kwargs):
         self.sent.append(content or "")
-        return _FakeDiscordMessage(7000 + len(self.sent))
+        embed = kwargs.get("embed")
+        if embed is not None:
+            self.embeds.append(embed)
+        message = _FakeDiscordMessage(7000 + len(self.sent) + len(self.embeds))
+        self.messages[message.id] = message
+        return message
+
+    async def fetch_message(self, message_id: int):
+        return self.messages[message_id]
+
+
+class _FakeAuthor:
+    bot = False
+
+    def __init__(self, author_id: int):
+        self.id = author_id
+
+
+class _FakeReference:
+    def __init__(self, message_id: int):
+        self.message_id = message_id
+
+
+class _FakeReplyMessage:
+    def __init__(self, message_id: int, channel: _FakeDiscordChannel, content: str, reference_id: int):
+        self.id = message_id
+        self.channel = channel
+        self.content = content
+        self.author = _FakeAuthor(123)
+        self.reference = _FakeReference(reference_id)
+
+
+class _FakeReactionPayload:
+    def __init__(self, message_id: int, channel_id: int, emoji: str, user_id: int = 123):
+        self.message_id = message_id
+        self.channel_id = channel_id
+        self.user_id = user_id
+        self.emoji = emoji
 
 
 def _tracker_config(root: Path) -> TrackerConfig:
@@ -77,8 +133,11 @@ def _tracker_config(root: Path) -> TrackerConfig:
         hydration_channel_name="habits",
         finance_channel_name="finance-tracker",
         work_channel_name="work-tracker",
+        daily_plan_channel_name="daily-plan",
+        review_channel_name="daily-plan",
         lifeos_root=root,
         tracker_db=root / "tracker.db",
+        hermes_home=root / ".hermes" / "profiles" / "lifeos",
         timezone="Africa/Casablanca",
         prayer_city="Casablanca",
         prayer_country="Morocco",
@@ -97,7 +156,81 @@ def _tracker_config(root: Path) -> TrackerConfig:
         work_overdue_grace_minutes=15,
         work_ai_cmd="",
         work_automation_ai_cmd="",
+        review_ai_cmd="",
+        morning_review_enabled=True,
+        morning_review_hour=7,
+        morning_review_minute=40,
+        review_item_expiry_hours=18,
     )
+
+
+def _minimal_lint_jobs(*, include_fallback: bool = True) -> list[dict]:
+    jobs = [
+        {
+            "id": "a1abddcdcf79",
+            "prompt": (
+                "Run scripts/build_discord_morning_summary.py. Hermes lifeos agent retries/refines. "
+                "Overnight system status finance review result memory review result needs-answer "
+                "Do not mention resolved finance reviews as blockers Prayer / Hydration. "
+                "Do not call send_message."
+            ),
+            "deliver": "discord:#daily-plan",
+            "schedule": {"expr": "35 7 * * *"},
+            "enabled": True,
+        },
+        {
+            "id": "4d661d5b4b5d",
+            "prompt": "Run scripts/build_morning_report.py. Hermes lifeos agent retries/refines.",
+            "deliver": "local",
+            "schedule": {"expr": "30 7 * * *"},
+            "enabled": True,
+        },
+        {
+            "id": "finance-review-autoprocess",
+            "prompt": "Run scripts/process_finance_reviews.py --all-open, then scripts/summarize_finance_day.py. AI-led review.",
+            "deliver": "local",
+            "schedule": {"expr": "0 1 * * *"},
+            "enabled": True,
+        },
+        {
+            "id": "work-review-autoprocess",
+            "prompt": "Run scripts/process_work_reviews.py --all-open.",
+            "deliver": "local",
+            "schedule": {"expr": "15 1 * * *"},
+            "enabled": True,
+        },
+        {
+            "id": "a48c14ea917b",
+            "prompt": "Use life-memory-review.",
+            "skill": "life-memory-review",
+            "skills": ["life-memory-review"],
+            "deliver": "local",
+            "schedule": {"expr": "10 2 * * *"},
+            "enabled": True,
+        },
+        {"id": "180421089e9e", "prompt": "", "deliver": "local", "schedule": {"expr": "30 1 * * *"}, "enabled": True},
+        {"id": "c70e18134a87", "prompt": "", "deliver": "local", "schedule": {"expr": "30 2 * * *"}, "enabled": True},
+        {"id": "12df41197bb9", "prompt": "", "deliver": "local", "schedule": {"expr": "0 3 * * *"}, "enabled": True},
+        {"id": "87eefd62d1c2", "prompt": "", "deliver": "local", "schedule": {"expr": "25 7 * * *"}, "enabled": True},
+        {
+            "id": "automation-health-weekly",
+            "prompt": "Run scripts/build_automation_health_report.py.",
+            "deliver": "local",
+            "schedule": {"expr": "15 10 * * 5"},
+            "enabled": True,
+        },
+    ]
+    if include_fallback:
+        jobs.append(
+            {
+                "id": "review-fallback-nightly",
+                "prompt": "Run scripts/process_review_fallback.py YYYY-MM-DD.",
+                "deliver": "local",
+                "schedule": {"expr": "45 1 * * *"},
+                "enabled": True,
+            }
+        )
+    return jobs
 
 
 class TrackerUnitTests(unittest.TestCase):
@@ -1242,6 +1375,432 @@ class TrackerStoreTests(unittest.TestCase):
                 self.assertTrue(await store.answer_work_clarification(capture_id, "The staging login timeout."))
                 reviews = await store.list_work_reviews()
                 self.assertEqual(reviews[0]["review_status"], "unreviewed")
+
+        asyncio.run(run_case())
+
+    def test_generic_review_item_and_discord_binding_are_durable(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                item = await store.create_review_item(
+                    kind="morning_question",
+                    title="Clarify morning item",
+                    body="Which commitment should move first?",
+                    source_path="reports/morning/2026-05-04.md",
+                    source_record_id="q1",
+                    source_kind="morning_report",
+                    missing_context=["priority"],
+                )
+                binding = await store.bind_discord_message(
+                    review_item_id=item["id"],
+                    discord_message_id=444,
+                    discord_channel_id=555,
+                    source_kind=item["source_kind"],
+                    source_id=item["source_record_id"],
+                    source_path=item["source_path"],
+                    action_on_reply="answer_question",
+                )
+                loaded = await store.get_review_item(item["id"])
+                self.assertEqual(loaded["discord_message_id"], 444)
+                self.assertEqual(binding["review_item_id"], item["id"])
+                self.assertTrue((root / "data" / "review").exists())
+                self.assertIn(item["id"], (root / "state" / "review-items.md").read_text(encoding="utf-8"))
+
+        asyncio.run(run_case())
+
+    def test_review_cards_are_posted_and_bound_to_discord_messages(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+                item = await store.create_review_item(
+                    kind="open_question",
+                    title="Open question",
+                    body="What should Hermis do with this?",
+                    source_path="inbox/needs-answer/2026-05-04.md",
+                    source_record_id="q1",
+                    source_kind="needs_answer",
+                )
+                message = await bot._post_review_card(channel, item)
+                binding = await store.get_discord_binding(message.id, channel.id)
+                loaded = await store.get_review_item(item["id"])
+                self.assertEqual(binding["review_item_id"], item["id"])
+                self.assertEqual(loaded["discord_message_id"], message.id)
+                self.assertIn("✅", message.reactions)
+                self.assertIn("❌", message.reactions)
+                self.assertIn("❓", message.reactions)
+
+        asyncio.run(run_case())
+
+    def test_review_reactions_approve_reject_and_request_clarification(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+
+                approve_item = await store.create_review_item(kind="open_question", title="Approve me", body="ok?")
+                approve_message = await bot._post_review_card(channel, approve_item)
+                approve_binding = await store.get_discord_binding(approve_message.id, channel.id)
+                await bot._handle_review_reaction(_FakeReactionPayload(approve_message.id, channel.id, "✅"), channel, approve_binding, "✅")
+                self.assertEqual((await store.get_review_item(approve_item["id"]))["status"], "approved")
+
+                reject_item = await store.create_review_item(kind="open_question", title="Reject me", body="ok?", source_record_id="reject")
+                reject_message = await bot._post_review_card(channel, reject_item)
+                reject_binding = await store.get_discord_binding(reject_message.id, channel.id)
+                await bot._handle_review_reaction(_FakeReactionPayload(reject_message.id, channel.id, "❌"), channel, reject_binding, "❌")
+                self.assertEqual((await store.get_review_item(reject_item["id"]))["status"], "rejected")
+
+                clarify_item = await store.create_review_item(kind="open_question", title="Clarify me", body="ok?", source_record_id="clarify")
+                clarify_message = await bot._post_review_card(channel, clarify_item)
+                clarify_binding = await store.get_discord_binding(clarify_message.id, channel.id)
+                await bot._handle_review_reaction(_FakeReactionPayload(clarify_message.id, channel.id, "❓"), channel, clarify_binding, "❓")
+                self.assertEqual((await store.get_review_item(clarify_item["id"]))["status"], "needs_clarification")
+
+        asyncio.run(run_case())
+
+    def test_reply_to_review_card_runs_ai_validation_and_attaches_detail(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+                item = await store.create_review_item(kind="open_question", title="Needs answer", body="Which project?")
+                card = await bot._post_review_card(channel, item)
+
+                async def fake_interpreter(_prompt: str):
+                    return {
+                        "intent": "answer_question",
+                        "answers": ["the staging login project"],
+                        "proposed_update": {"answer": "the staging login project"},
+                        "confidence": "low",
+                        "missing_context": ["which deadline this affects"],
+                    }
+
+                bot.input_interpreter = AIInputInterpreter(fake_interpreter)
+                bot.validation_pass = AIValidationPass()
+                reply = _FakeReplyMessage(8800, channel, "It was the staging login project.", card.id)
+                handled = await bot._maybe_handle_review_reply(reply, reply.content)
+                loaded = await store.get_review_item(item["id"])
+                self.assertTrue(handled)
+                self.assertEqual(loaded["status"], "needs_clarification")
+                self.assertEqual(loaded["ai_interpretation"]["intent"], "answer_question")
+                self.assertEqual(loaded["ai_validation"]["decision"], "ask_clarification")
+
+        asyncio.run(run_case())
+
+    def test_review_prioritizer_orders_blocking_expired_and_low_confidence_items(self) -> None:
+        now = datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc)
+        prioritizer = ReviewPrioritizer(now)
+        items = [
+            {
+                "id": "normal",
+                "kind": "open_question",
+                "title": "Can answer later",
+                "body": "Which label should this use?",
+                "source_kind": "needs_answer",
+                "status": "pending",
+                "confidence": "medium",
+                "missing_context": [],
+                "created_at_utc": "2026-05-04T09:00:00+00:00",
+            },
+            {
+                "id": "low-confidence",
+                "kind": "work_suggestion",
+                "title": "Work blocker",
+                "body": "Low confidence work suggestion needs context",
+                "source_kind": "work_ai_suggestion",
+                "status": "pending",
+                "confidence": "low",
+                "missing_context": ["which task"],
+                "created_at_utc": "2026-05-04T08:00:00+00:00",
+            },
+            {
+                "id": "expired",
+                "kind": "open_question",
+                "title": "Expired question",
+                "body": "Old unresolved item",
+                "source_kind": "needs_answer",
+                "status": "expired",
+                "confidence": "medium",
+                "missing_context": [],
+                "created_at_utc": "2026-05-03T08:00:00+00:00",
+            },
+        ]
+        ordered = prioritizer.prioritize(items)
+        self.assertEqual([item["id"] for item in ordered[:2]], ["expired", "low-confidence"])
+        self.assertEqual(ordered[0]["priority"], "urgent")
+        self.assertEqual(ordered[-1]["priority"], "normal")
+
+    def test_safe_auto_processor_refuses_sensitive_and_processes_only_safe_high_confidence(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                finance = await store.create_review_item(
+                    kind="finance_review",
+                    title="Finance claim",
+                    body="Approve this transaction",
+                    source_kind="finance_parse_review",
+                    ai_validation={"confidence": "high", "safe_to_persist": True, "missing_context": []},
+                    confidence="high",
+                    automation_policy=AUTO_PROCESS_SAFE,
+                )
+                memory = await store.create_review_item(
+                    kind="morning_question",
+                    title="Durable memory claim",
+                    body="Make this durable memory claim about identity.",
+                    source_kind="needs_answer",
+                    source_record_id="memory",
+                    ai_validation={"confidence": "high", "safe_to_persist": True, "missing_context": []},
+                    confidence="high",
+                    automation_policy=AUTO_PROCESS_SAFE,
+                )
+                safe = await store.create_review_item(
+                    kind="open_question",
+                    title="Low-risk note",
+                    body="Attach harmless detail to temporary review note.",
+                    source_kind="low_risk_note",
+                    source_record_id="safe",
+                    ai_validation={"confidence": "high", "safe_to_persist": True, "missing_context": []},
+                    confidence="high",
+                    automation_policy=AUTO_PROCESS_SAFE,
+                )
+                processor = SafeAutoProcessor(store)
+                self.assertFalse(processor.can_auto_process(finance))
+                self.assertFalse(processor.can_auto_process(memory))
+                processed = await processor.process_pending(limit=10)
+                self.assertEqual([item["id"] for item in processed], [safe["id"]])
+                self.assertEqual((await store.get_review_item(safe["id"]))["status"], "auto_processed")
+                self.assertEqual((await store.get_review_item(finance["id"]))["status"], "pending")
+
+        asyncio.run(run_case())
+
+    def test_one_discord_reply_can_update_linked_review_items(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+                first = await store.create_review_item(kind="open_question", title="Question one", body="First?")
+                second = await store.create_review_item(
+                    kind="open_question",
+                    title="Question two",
+                    body="Second?",
+                    source_record_id="second",
+                )
+                card = await bot._post_review_card(channel, first)
+                await store.bind_discord_message(
+                    review_item_id=first["id"],
+                    discord_message_id=card.id,
+                    discord_channel_id=channel.id,
+                    source_kind="morning_digest",
+                    source_id=f"{first['id']},{second['id']}",
+                    action_on_reply="morning_digest",
+                )
+
+                async def fake_interpreter(_prompt: str):
+                    return {
+                        "intent": "answer_question",
+                        "answers": ["both are done"],
+                        "proposed_update": {"answer": "both are done"},
+                        "confidence": "high",
+                        "missing_context": [],
+                    }
+
+                async def fake_validator(_prompt: str):
+                    return {
+                        "valid": True,
+                        "decision": "propose_update",
+                        "confidence": "high",
+                        "missing_context": [],
+                        "contradictions": [],
+                        "unsafe_assumptions": [],
+                        "safe_to_persist": True,
+                        "proposed_status": "approved",
+                        "related_review_item_ids": [second["id"]],
+                        "improved_update": {"answer": "both are done"},
+                    }
+
+                bot.input_interpreter = AIInputInterpreter(fake_interpreter)
+                bot.validation_pass = AIValidationPass(fake_validator)
+                reply = _FakeReplyMessage(8801, channel, "Both are done.", card.id)
+                handled = await bot._maybe_handle_review_reply(reply, reply.content)
+                self.assertTrue(handled)
+                self.assertEqual((await store.get_review_item(first["id"]))["status"], "approved")
+                self.assertEqual((await store.get_review_item(second["id"]))["status"], "approved")
+                self.assertIn("Also updated", channel.sent[-1])
+
+        asyncio.run(run_case())
+
+    def test_morning_report_summary_and_questions_publish_to_discord_review_inbox(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                report_dir = root / "reports" / "morning"
+                report_dir.mkdir(parents=True)
+                report = report_dir / "2026-05-04.md"
+                report.write_text(
+                    "# Morning Report - 2026-05-04\n\n"
+                    "## Top 3 Priorities\n- Ship the review workflow\n\n"
+                    "## Due or Overdue Commitments\n- none\n\n"
+                    "## Deen Anchor\n- Dhuhr anchor\n\n"
+                    "## Health Anchor\n- hydrate\n\n"
+                    "## Prayer / Hydration\n- Total: 4/5 logged\n- Total: 6/8\n\n"
+                    "## Memory Review Needed\n- review: Should this become durable memory?\n\n"
+                    "## One Next Action\n- Open Discord review inbox\n",
+                    encoding="utf-8",
+                )
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+                items = await bot.publish_morning_report("2026-05-04", channel=channel, force=True)
+                self.assertTrue(report.exists())
+                self.assertIn("Today's Review Inbox - 2026-05-04", channel.sent[0])
+                self.assertIn("needs decision now", channel.sent[0])
+                self.assertEqual(len(items), 1)
+                self.assertEqual(items[0]["kind"], "morning_question")
+                self.assertGreaterEqual(len(channel.embeds), 1)
+
+        asyncio.run(run_case())
+
+    def test_morning_digest_groups_items_without_losing_individual_bindings(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                bot = DiscordTracker(_tracker_config(root), store)
+                channel = _FakeDiscordChannel()
+                urgent = await store.create_review_item(
+                    kind="open_question",
+                    title="Blocking review",
+                    body="This blocks morning. What now?",
+                    source_kind="needs_answer",
+                    source_record_id="urgent",
+                    confidence="low",
+                    missing_context=["decision"],
+                )
+                normal = await store.create_review_item(
+                    kind="open_question",
+                    title="Normal review",
+                    body="Can answer when easy.",
+                    source_kind="needs_answer",
+                    source_record_id="normal",
+                    confidence="medium",
+                )
+                digest = ReviewDigestBuilder(ReviewPrioritizer()).build([urgent, normal], "2026-05-04")
+                self.assertIn("needs decision now", digest.text)
+                self.assertIn("answer when easy", digest.text)
+                self.assertEqual([item["id"] for item in digest.cards], [urgent["id"], normal["id"]])
+                for item in digest.cards:
+                    message = await bot._post_review_card(channel, item)
+                    binding = await store.get_discord_binding(message.id, channel.id)
+                    self.assertEqual(binding["review_item_id"], item["id"])
+
+        asyncio.run(run_case())
+
+    def test_nightly_fallback_expires_and_resurfaces_unclear_review_items(self) -> None:
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                store = TrackerStore(root / "tracker.db", root)
+                await store.init()
+                await store.create_review_item(
+                    kind="open_question",
+                    title="Expired question",
+                    body="What is the missing detail?",
+                    source_path="reports/morning/2026-05-04.md",
+                    source_record_id="expired",
+                    source_kind="morning_report",
+                    expires_at_utc="2026-05-04T00:00:00+00:00",
+                )
+                output = root / "reports" / "nightly" / "2026-05-04-review-fallback.md"
+                await run_fallback(ReviewFallbackConfig(root=root, db_path=root / "tracker.db"), "2026-05-04", output)
+                self.assertTrue(output.exists())
+                needs_answer = root / "inbox" / "needs-answer" / "2026-05-04-review.md"
+                self.assertTrue(needs_answer.exists())
+                candidates = morning_review_candidates(root, "2026-05-05", "")
+                self.assertTrue(any("missing detail" in item["body"] for item in candidates))
+
+        asyncio.run(run_case())
+
+    def test_weekly_automation_health_report_includes_required_counts(self) -> None:
+        events = [
+            {"review_item_id": "a", "event": "status:auto_processed", "payload": {"status": "auto_processed"}, "created_at_utc": "2026-05-04T01:00:00+00:00"},
+            {"review_item_id": "b", "event": "status:approved", "payload": {"status": "approved"}, "created_at_utc": "2026-05-04T01:00:00+00:00"},
+            {"review_item_id": "c", "event": "status:rejected", "payload": {"status": "rejected"}, "created_at_utc": "2026-05-04T01:00:00+00:00"},
+            {"review_item_id": "d", "event": "expired", "payload": {}, "created_at_utc": "2026-05-04T01:00:00+00:00"},
+            {"review_item_id": "e", "event": "surfaced", "payload": {}, "created_at_utc": "2026-05-04T01:00:00+00:00"},
+        ]
+        items = [{"status": "pending", "kind": "open_question", "body": "Repeated?", "created_at_utc": "2026-05-01T01:00:00+00:00"}]
+        text = build_automation_health_report("2026-05-04", events, items)
+        for label in ("Auto-processed: 1", "Approved: 1", "Rejected: 1", "Expired: 1", "Resurfaced: 1", "Still pending: 1"):
+            self.assertIn(label, text)
+
+    def test_report_lint_detects_missing_review_fallback_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            report_dir = root / "reports" / "morning"
+            report_dir.mkdir(parents=True)
+            (root / "data" / "daily-summary").mkdir(parents=True)
+            (root / "inbox" / "needs-answer").mkdir(parents=True)
+            (report_dir / "2026-05-04.md").write_text(
+                "# Morning Report - 2026-05-04\n\n"
+                "## Top 3 Priorities\n- one\n\n"
+                "## Due or Overdue Commitments\n- none\n\n"
+                "## Deen Anchor\n- prayer\n\n"
+                "## Health Anchor\n- water\n\n"
+                "## Prayer / Hydration\n- Total: 4/5 logged\n\n"
+                "## Work / Money Anchor\n- none\n\n"
+                "## Overnight Research\n- none\n\n"
+                "## Memory Review Needed\n- none\n\n"
+                "## One Next Action\n- start\n",
+                encoding="utf-8",
+            )
+            jobs_path = root / "jobs.json"
+            jobs_path.write_text(json.dumps({"jobs": _minimal_lint_jobs(include_fallback=False)}), encoding="utf-8")
+            env = {
+                **os.environ,
+                "LIFEOS_ROOT": str(root),
+                "HERMIS_LIFEOS_JOBS": str(jobs_path),
+            }
+            completed = subprocess.run(
+                ["bash", str(ROOT_DIR / "scripts" / "report_lint.sh"), "2026-05-04"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("review fallback cron job missing", completed.stdout)
+
+    def test_ai_validation_marks_low_confidence_interpretation_unclear(self) -> None:
+        async def run_case() -> None:
+            validation = await AIValidationPass().validate(
+                {
+                    "intent": "add_detail",
+                    "confidence": "low",
+                    "missing_context": ["which item this refers to"],
+                    "proposed_update": {},
+                },
+                {"review_item": {"id": "review-test"}},
+            )
+            self.assertEqual(validation["decision"], "ask_clarification")
+            self.assertFalse(validation["safe_to_persist"])
 
         asyncio.run(run_case())
 

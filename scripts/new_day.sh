@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${LIFEOS_ROOT:-/home/ubuntu/hermis-life-os}"
+ROOT="${LIFEOS_ROOT:-$HOME/hermis-life-os}"
 DAY="${1:-$(date +%F)}"
 
 mkdir -p \
@@ -18,6 +18,7 @@ mkdir -p \
   "$ROOT/data/prayer" \
   "$ROOT/data/hydration" \
   "$ROOT/data/finance" \
+  "$ROOT/data/review" \
   "$ROOT/logs" \
   "$ROOT/backups"
 
